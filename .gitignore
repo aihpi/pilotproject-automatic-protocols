@@ -198,3 +198,4 @@ data
 # Local temporary files
 tmp/
 .cursorindexingignore
+notes.md
