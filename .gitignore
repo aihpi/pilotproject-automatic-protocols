@@ -194,8 +194,13 @@ cython_debug/
 
 # Data (symlinked to shared storage)
 data
+data_old
+logs/
+# Training outputs (adapters) and generated summaries
+results/
 
 # Local temporary files
 tmp/
 .cursorindexingignore
 notes.md
+.claude/
