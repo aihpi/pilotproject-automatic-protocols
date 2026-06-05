@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 from docx_to_markdown import convert_docx
 from pdf_to_markdown import convert_pdf, make_converter
-from preprocess_protocol import split_front_matter, strip_before_marker
+from preprocess_protocol import clean_protocol, split_front_matter
 
 DEFAULT_SYSTEM_PROMPT = (
     "Du bist Protokollführer/in eines Ausschusses des Landtags Brandenburg. "
@@ -45,6 +45,12 @@ DEFAULT_SYSTEM_PROMPT = (
 TOP_TAG_RE = re.compile(r"<SD-TOP>(.*?)</SD>", re.DOTALL)
 TOP_NUM_RE = re.compile(r"(?i)\b(?:TOP|Tagesordnungspunkt)\s*(\d+)")
 PROT_TOP_RE = re.compile(r"(?i)\bzu\s+TOP\s*(\d+)\b")
+# Committee protocols make two ascending passes over the TOPs: a terse decision
+# summary, then the substantive discussion. Split each pass on its own so the
+# numbering stays monotonic, then merge by TOP.
+PROT_BESCHLUSS_RE = re.compile(r"(?im)^##\s*Beschlüsse und Festlegungen")
+PROT_BERATUNG_RE = re.compile(r"(?im)^##\s*Aus der Beratung")
+PROT_ANLAGE_RE = re.compile(r"(?im)^##\s*Anlage")
 
 
 def approx_tokens(text: str) -> int:
@@ -72,11 +78,12 @@ def read_protocol(path: Path, *, marker: str, converter=None) -> str:
     if path.suffix.lower() == ".pdf":
         text = convert_pdf(path, converter)
     else:
-        _, text = split_front_matter(path.read_text(encoding="utf-8"))
-    cleaned, _ = strip_before_marker(text, marker)
-    # strip_before_marker keeps front matter only when present; here text has none
-    _, cleaned_body = split_front_matter(cleaned)
-    return (cleaned_body or cleaned).strip()
+        text = path.read_text(encoding="utf-8")
+    # Cover off, attachments and page noise stripped. Idempotent on already-clean
+    # md_clean files; also handles raw .md / freshly converted .pdf. (``marker``
+    # is unused for committee protocols, accepted for backward compatibility.)
+    _, body, _ = clean_protocol(text)
+    return body.strip()
 
 
 def _monotonic_sections(boundaries: list[tuple[int, int]], text: str) -> dict[int, str]:
@@ -107,9 +114,43 @@ def split_transcript_by_top(text: str) -> dict[int, str]:
     return _monotonic_sections(boundaries, text)
 
 
-def split_protocol_by_top(text: str) -> dict[int, str]:
+def _section_bounds(text: str) -> tuple[str, str]:
+    """Slice a cleaned protocol into its (Beschlüsse, Aus der Beratung) passes."""
+    b = PROT_BESCHLUSS_RE.search(text)
+    r = PROT_BERATUNG_RE.search(text)
+    a = PROT_ANLAGE_RE.search(text)
+    end = a.start() if a else len(text)
+    if r:
+        beschluss = text[b.start():r.start()] if b else text[:r.start()]
+        beratung = text[r.start():end]
+    else:
+        beschluss = text[b.start():end] if b else ""
+        beratung = ""
+    return beschluss, beratung
+
+
+def _split_pass(text: str) -> dict[int, str]:
     boundaries = [(int(m.group(1)), m.start()) for m in PROT_TOP_RE.finditer(text)]
     return _monotonic_sections(boundaries, text)
+
+
+def split_protocol_by_top(text: str) -> dict[int, str]:
+    """Map TOP number -> decision summary + discussion for that agenda item.
+
+    Splits the ``Beschlüsse und Festlegungen`` and ``Aus der Beratung`` passes
+    independently (each monotonic on its own) and merges them per TOP. Falls back
+    to a single monotonic pass over the whole text when the section headings are
+    absent (e.g. non-standard layout)."""
+    beschluss, beratung = _section_bounds(text)
+    if not beschluss and not beratung:
+        return _split_pass(text)
+    bm = _split_pass(beschluss)
+    rm = _split_pass(beratung)
+    out: dict[int, str] = {}
+    for n in sorted(set(bm) | set(rm)):
+        out[n] = "\n\n".join(s for s in (bm.get(n, "").strip(),
+                                          rm.get(n, "").strip()) if s)
+    return out
 
 
 def make_record(system: str, user: str, assistant: str, meta: dict) -> dict:
@@ -175,9 +216,17 @@ def main() -> int:
                    help="File with a custom system prompt (default: built-in German prompt)")
     p.add_argument("--seed", type=int, default=42,
                    help="Seed for the session-level train/val shuffle (default: 42)")
+    p.add_argument("--exclusions", type=Path, default=None,
+                   help="JSON {stem: [tops]} of per-TOP records to skip "
+                        "(e.g. match_speakers.py exclusions.json)")
     p.add_argument("--overwrite", action="store_true",
                    help="Overwrite existing train.jsonl / val.jsonl")
     args = p.parse_args()
+
+    excluded: dict[str, set[int]] = {}
+    if args.exclusions:
+        raw = json.loads(args.exclusions.read_text(encoding="utf-8"))
+        excluded = {k: set(v) for k, v in raw.items()}
 
     for d in (args.transcript_dir, args.protocol_dir):
         if not d.is_dir():
@@ -207,6 +256,7 @@ def main() -> int:
     # session_key -> list[record]
     sessions: dict[str, list[dict]] = {}
     dropped = 0
+    excluded_n = 0
     failures: list[tuple[str, str]] = []
     for tx_path, pr_path in tqdm(pairs, desc="build", unit="pair"):
         key = normalise_stem(tx_path.stem)
@@ -224,16 +274,22 @@ def main() -> int:
             pr_tops = split_protocol_by_top(protocol)
             common = sorted(set(tx_tops) & set(pr_tops))
             for n in common:
+                if n in excluded.get(key, ()):  # unresolved speaker(s) -> drop
+                    excluded_n += 1
+                    continue
                 if approx_tokens(pr_tops[n]) < args.min_tgt_tokens:
                     dropped += 1
                     continue
                 recs.append(make_record(system, tx_tops[n], pr_tops[n],
                                         {"stem": key, "top": n, "strategy": "per-top"}))
-            if not recs:  # alignment failed -> whole-document fallback
+            if not common:  # alignment genuinely failed -> whole-document fallback
                 print(f"  no aligned TOPs for {tx_path.name}; document fallback",
                       file=sys.stderr)
                 recs.append(make_record(system, transcript, protocol,
                                         {"stem": key, "strategy": "document-fallback"}))
+            elif not recs:  # had aligned TOPs but all excluded/short -> contribute nothing
+                print(f"  all aligned TOPs filtered for {tx_path.name}; skipped",
+                      file=sys.stderr)
         else:
             if approx_tokens(protocol) >= args.min_tgt_tokens:
                 recs.append(make_record(system, transcript, protocol,
@@ -273,7 +329,8 @@ def main() -> int:
     src_tok = [r["meta"]["src_tokens"] for v in sessions.values() for r in v]
     print("\n=== dataset summary ===", file=sys.stderr)
     print(f"sessions: {len(keys)} ({len(val_keys)} val)", file=sys.stderr)
-    print(f"records:  {n_train} train, {n_val_recs} val (dropped {dropped} short)", file=sys.stderr)
+    print(f"records:  {n_train} train, {n_val_recs} val "
+          f"(dropped {dropped} short, {excluded_n} excluded)", file=sys.stderr)
     if src_tok:
         print(f"src tokens (approx): min {min(src_tok)} / "
               f"median {sorted(src_tok)[len(src_tok)//2]} / max {max(src_tok)}", file=sys.stderr)

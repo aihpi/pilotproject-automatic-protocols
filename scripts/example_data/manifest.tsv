@@ -1,0 +1,17 @@
+# Example-data source pairs for the Landtag Brandenburg LoRA pipeline.
+#
+# One plenary sitting per row. The video/protocol link is the SITTING NUMBER:
+# sitting N has a Mediathek video page and a protocol PDF at
+#   parladoku/w8/plpr/<N>.pdf   (w8 = 8. Wahlperiode)
+# All plenary sittings are public ("öffentlich").
+#
+# Columns (tab-separated):  number <TAB> mediathek_url
+# The protocol URL is derived from `number`; see scripts/example_data/download.py.
+#
+# Add a new pair: open the Mediathek (https://www.landtag.brandenburg.de/de/aktuelles/neuigkeiten/mediathek/),
+# copy the plenary-sitting page URL, and add a row with its sitting number.
+#
+# number	mediathek_url
+29	https://www.landtag.brandenburg.de/de/aktuelles/neuigkeiten/mediathek/29._sitzung_des_landtages_brandenburg/47559
+30	https://www.landtag.brandenburg.de/de/aktuelles/neuigkeiten/mediathek/30._sitzung_des_landtages_brandenburg/47841
+31	https://www.landtag.brandenburg.de/de/aktuelles/neuigkeiten/mediathek/31._sitzung_des_landtages_brandenburg/47896

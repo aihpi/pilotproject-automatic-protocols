@@ -192,9 +192,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 
-# Data (symlinked to shared storage)
-data
-data_old
+# Data: the symlinked shared-storage trees (data, data_old) and all locally-built
+# example datasets (data_example01, data_example02, …). Never committed — videos are
+# multi-GB and the corpus is not redistributable. Matches any root-level "data*".
+/data*
 logs/
 # Training outputs (adapters) and generated summaries
 results/
@@ -202,5 +203,5 @@ results/
 # Local temporary files
 tmp/
 .cursorindexingignore
-notes.md
+notes/
 .claude/
