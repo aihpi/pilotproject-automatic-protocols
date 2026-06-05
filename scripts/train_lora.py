@@ -2,21 +2,29 @@
 """Fine-tune an instruction LLM with (Q)LoRA on transcript->protocol pairs.
 
 Reads the JSONL chat datasets produced by ``scripts/build_dataset.py`` and trains
-a LoRA adapter with TRL's ``SFTTrainer``. Defaults target Llama-3.3-70B-Instruct
-in 4-bit (QLoRA) on a single 80 GB H100; the prompt (system + transcript) is
+a LoRA adapter with TRL's ``SFTTrainer``; the prompt (system + transcript) is
 masked so loss is computed only on the protocol completion.
 
-At 70B, 4-bit is effectively required on one GPU (16-bit LoRA would need ~140 GB);
-``--bits 16`` is meant for smaller ``--base-model`` overrides. The adapter and
-tokenizer are written to ``--out-dir`` for use by ``scripts/infer_summary.py``.
+Real runs use 16-bit LoRA (``--bits 16``, the default) which fits gemma-4-31B-it
+on a single 80 GB H100; 4-bit QLoRA (``--bits 4``) is the smoke-test shortcut.
+Adapters are auto-named ``results/YYYYMMDD_XX_lora`` with a matching
+``results/YYYYMMDD_XX_log.md`` of the run parameters (smoke runs go to
+``results/smoke_lora``); pass ``--out-dir`` to override. Training is logged to
+TensorBoard under ``results/tensorboard``; with a validation set, the best model
+is kept via early stopping. The adapter + tokenizer are written for
+``scripts/infer_summary.py``.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+
+from model_utils import context_window, next_adapter_stamp
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,12 +36,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-model", default="google/gemma-4-E2B-it",
                    help="HF model id or local path (default: google/gemma-4-E2B-it for "
                         "testing; scale up with e.g. google/gemma-4-31B-it)")
-    p.add_argument("--out-dir", type=Path, default=Path("results/lora_adapter"),
-                   help="Directory for the trained adapter (default: results/lora_adapter)")
-    p.add_argument("--bits", type=int, choices=(4, 16), default=4,
-                   help="4 = QLoRA (NF4), 16 = bf16 LoRA (default: 4)")
-    p.add_argument("--max-seq-len", type=int, default=4096,
-                   help="Max packed sequence length in tokens (default: 4096)")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Adapter output dir. Default: auto-named results/YYYYMMDD_XX_lora for "
+                        "16-bit runs (+ a YYYYMMDD_XX_log.md), results/smoke_lora for 4-bit "
+                        "smoke runs. Pass a path to override.")
+    p.add_argument("--bits", type=int, choices=(4, 16), default=16,
+                   help="16 = bf16 LoRA (default, real runs), 4 = QLoRA NF4 (smoke test)")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Max packed sequence length in tokens. Default: the base model's "
+                        "context window (auto-detected, e.g. gemma-4-31B-it = 262144).")
     p.add_argument("--lora-r", type=int, default=16, help="LoRA rank (default: 16)")
     p.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha (default: 32)")
     p.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout (default: 0.05)")
@@ -71,6 +82,9 @@ def parse_args() -> argparse.Namespace:
                    help="Pack multiple short examples per sequence (good for per-TOP data)")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
+    p.add_argument("--early-stopping-patience", type=int, default=2,
+                   help="Stop after N evals without eval_loss improvement and keep the best "
+                        "model (default: 2; only active with a validation set)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     p.add_argument("--overwrite", action="store_true",
                    help="Train even if --out-dir already contains an adapter")
@@ -118,14 +132,93 @@ def build_model_and_tokenizer(args: argparse.Namespace):
     return model, tokenizer
 
 
+def resolve_output(args: argparse.Namespace) -> tuple[Path, Path | None]:
+    """Decide the adapter dir and (optional) sibling log path.
+
+    explicit --out-dir -> use it + ``<dir>_log.md``; 4-bit -> results/smoke_lora
+    (no dated log); 16-bit -> results/YYYYMMDD_XX_lora + results/YYYYMMDD_XX_log.md.
+    """
+    results = Path("results")
+    if args.out_dir is not None:
+        out = args.out_dir
+        return out, out.parent / f"{out.name}_log.md"
+    if args.bits == 4:
+        return results / "smoke_lora", None
+    stamp = next_adapter_stamp(results, datetime.now().strftime("%Y%m%d"))
+    return results / f"{stamp}_lora", results / f"{stamp}_log.md"
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def write_train_log(log_path: Path, args: argparse.Namespace, *, out_dir: Path,
+                    logging_dir: str, n_train: int, n_val: int, train_loss: float,
+                    best_metric, best_ckpt) -> None:
+    """Write a Markdown log of the run parameters for later comparison."""
+    eff_batch = args.batch_size * args.grad_accum
+    rows = [
+        ("date", datetime.now().isoformat(timespec="seconds")),
+        ("git commit", _git_commit()),
+        ("SLURM job", os.environ.get("SLURM_JOB_ID", "-")),
+        ("base model", args.base_model),
+        ("bits", f"{args.bits} ({'QLoRA NF4' if args.bits == 4 else 'bf16 LoRA'})"),
+        ("adapter dir", str(out_dir)),
+        ("tensorboard", logging_dir),
+        ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
+        ("target modules", args.target_modules),
+        ("exclude modules", args.exclude_modules or "-"),
+        ("learning rate", args.lr),
+        ("lr scheduler / warmup", f"{args.lr_scheduler} / {args.warmup_ratio}"),
+        ("weight decay", args.weight_decay),
+        ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
+        ("batch / grad-accum / effective", f"{args.batch_size} / {args.grad_accum} / {eff_batch}"),
+        ("max seq len", args.max_seq_len),
+        ("packing", args.packing),
+        ("attention", args.attn),
+        ("optimizer", "paged_adamw_8bit"),
+        ("seed", args.seed),
+        ("early-stopping patience", args.early_stopping_patience if n_val else "n/a (no val set)"),
+        ("train jsonl", str(args.train_jsonl)),
+        ("val jsonl", str(args.val_jsonl) if args.val_jsonl else "-"),
+        ("records (train / val)", f"{n_train} / {n_val}"),
+        ("final train loss", f"{train_loss:.4f}"),
+        ("best eval_loss", f"{best_metric:.4f}" if best_metric is not None else "-"),
+        ("best checkpoint", best_ckpt or "-"),
+    ]
+    lines = [f"# Training run — {out_dir.name}", "",
+             "| Parameter | Value |", "|---|---|"]
+    lines += [f"| {k} | {v} |" for k, v in rows]
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote run log to {log_path}", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
 
     if not args.train_jsonl.exists():
         print(f"{args.train_jsonl} not found", file=sys.stderr)
         return 1
-    if (args.out_dir / "adapter_config.json").exists() and not args.overwrite:
-        print(f"{args.out_dir} already has an adapter; use --overwrite", file=sys.stderr)
+
+    if args.max_seq_len is None:
+        args.max_seq_len = context_window(args.base_model)
+    out_dir, log_path = resolve_output(args)
+    args.out_dir = out_dir
+    # Collect all runs under one parent so `tensorboard --logdir results/tensorboard`
+    # compares them. The TrainingArguments `logging_dir` field is deprecated and
+    # ignored by the TB callback; the env var is the supported way to set it.
+    logging_dir = str(Path("results/tensorboard") / out_dir.name)
+    os.environ["TENSORBOARD_LOGGING_DIR"] = logging_dir
+    print(f"adapter -> {out_dir} (bits={args.bits}, max-seq-len={args.max_seq_len}); "
+          f"tensorboard -> {logging_dir}", file=sys.stderr)
+
+    if (out_dir / "adapter_config.json").exists() and not args.overwrite:
+        print(f"{out_dir} already has an adapter; use --overwrite", file=sys.stderr)
         return 1
 
     from datasets import load_dataset
@@ -170,7 +263,12 @@ def main() -> int:
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
-        report_to="none",
+        # keep the best (lowest eval_loss) model when a val set is present
+        load_best_model_at_end=has_val,
+        metric_for_best_model="eval_loss" if has_val else None,
+        greater_is_better=False if has_val else None,
+        save_total_limit=2,
+        report_to="tensorboard",
         seed=args.seed,
         dataset_num_proc=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
@@ -183,14 +281,27 @@ def main() -> int:
         peft_config=lora_config,
         processing_class=tokenizer,
     )
+    if has_val:
+        from transformers import EarlyStoppingCallback
+        trainer.add_callback(
+            EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
 
     result = trainer.train(resume_from_checkpoint=str(args.resume) if args.resume else None)
     print(f"final train loss: {result.training_loss:.4f}", file=sys.stderr)
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(args.out_dir))
-    tokenizer.save_pretrained(str(args.out_dir))
-    print(f"saved adapter to {args.out_dir}", file=sys.stderr)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trainer.save_model(str(out_dir))
+    tokenizer.save_pretrained(str(out_dir))
+    print(f"saved adapter to {out_dir}", file=sys.stderr)
+
+    if log_path is not None:
+        write_train_log(
+            log_path, args, out_dir=out_dir, logging_dir=logging_dir,
+            n_train=len(dataset["train"]),
+            n_val=len(dataset["validation"]) if has_val else 0,
+            train_loss=result.training_loss,
+            best_metric=trainer.state.best_metric,
+            best_ckpt=trainer.state.best_model_checkpoint)
     return 0
 
 

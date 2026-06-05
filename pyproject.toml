@@ -6,8 +6,8 @@ dependencies = [
     "numpy>=2.4.4",
     "openai-whisper>=20250625",
     "torch>=2.11.0",
-    "torchvision>=0.26.0",  # pulled by docling/transformers; must match cu128 torch
-    "torchaudio>=2.11.0",   # pyannote runtime dep; must match cu128 torch
+    "torchvision>=0.26.0", # pulled by docling/transformers; must match cu128 torch
+    "torchaudio>=2.11.0", # pyannote runtime dep; must match cu128 torch
     "tqdm>=4.67.3",
     # Speaker diarisation (transcribe.py --diarize); gated model needs HF_TOKEN.
     # 4.x is required: 3.x calls torchaudio.AudioMetaData, removed in the
@@ -22,7 +22,7 @@ dependencies = [
     # Headless OpenCV: the cluster has no libGL, so the default opencv-python
     # (pulled by docling's OCR deps) fails to import cv2. See [tool.uv] override.
     "opencv-python-headless>=4.10.0.84",
-    "python-docx>=1.1.2",  # raw-whitespace parsing for the one-off transcript repair
+    "python-docx>=1.1.2", # raw-whitespace parsing for the one-off transcript repair
     "rapidfuzz>=3.10.1",
     # Speaker resolution LLM fallback (match_speakers.py --use-llm) + .env loading
     "openai>=1.0",
@@ -35,6 +35,7 @@ dependencies = [
     "accelerate>=1.0.0",
     "bitsandbytes>=0.44.0",
     "sentencepiece>=0.2.0",
+    "tensorboard>=2.20.0",
 ]
 
 [tool.uv]

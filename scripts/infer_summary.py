@@ -19,6 +19,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from build_dataset import DEFAULT_SYSTEM_PROMPT, split_transcript_by_top
+from model_utils import context_window
 from preprocess_protocol import split_front_matter
 
 
@@ -68,13 +69,21 @@ def generate(model, tokenizer, system: str, user: str, args: argparse.Namespace)
 
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
-    inputs = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+    # return_dict=True so we get input_ids/attention_mask explicitly; the bare
+    # return_tensors="pt" form yields a BatchEncoding (no .shape) on current
+    # transformers and crashes with an empty AttributeError.
+    enc = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    input_ids = enc["input_ids"].to(model.device)
+    attn = enc.get("attention_mask")
+    if attn is not None:
+        attn = attn.to(model.device)
 
-    if inputs.shape[-1] > args.max_seq_len:
-        print(f"  WARNING: prompt {inputs.shape[-1]} > max-seq-len {args.max_seq_len}; "
+    if input_ids.shape[-1] > args.max_seq_len:
+        print(f"  WARNING: prompt {input_ids.shape[-1]} > max-seq-len {args.max_seq_len}; "
               f"truncating input", file=sys.stderr)
-        inputs = inputs[:, -args.max_seq_len:]
+        input_ids = input_ids[:, -args.max_seq_len:]
+        attn = attn[:, -args.max_seq_len:] if attn is not None else None
 
     streamer = None
     if args.stream:
@@ -83,7 +92,8 @@ def generate(model, tokenizer, system: str, user: str, args: argparse.Namespace)
 
     with torch.no_grad():
         out = model.generate(
-            inputs,
+            input_ids,
+            attention_mask=attn,
             max_new_tokens=args.max_new_tokens,
             do_sample=args.temperature > 0,
             temperature=args.temperature if args.temperature > 0 else None,
@@ -92,7 +102,7 @@ def generate(model, tokenizer, system: str, user: str, args: argparse.Namespace)
             eos_token_id=tokenizer.eos_token_id,
             streamer=streamer,
         )
-    return tokenizer.decode(out[0, inputs.shape[-1]:], skip_special_tokens=True).strip()
+    return tokenizer.decode(out[0, input_ids.shape[-1]:], skip_special_tokens=True).strip()
 
 
 def summarise(model, tokenizer, transcript: str, system: str, args: argparse.Namespace) -> str:
@@ -146,8 +156,9 @@ def main() -> int:
                    help="Summarise per agenda item or whole document (default: per-top)")
     p.add_argument("--max-new-tokens", type=int, default=4096,
                    help="Max generated tokens per call (default: 4096)")
-    p.add_argument("--max-seq-len", type=int, default=4096,
-                   help="Max prompt length before truncation (default: 4096)")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Max prompt length before truncation. Default: the model's context "
+                        "window (auto-detected, e.g. gemma-4-31B-it = 262144).")
     p.add_argument("--temperature", type=float, default=0.3,
                    help="Sampling temperature; 0 = greedy (default: 0.3)")
     p.add_argument("--top-p", type=float, default=0.9, help="Nucleus top-p (default: 0.9)")
@@ -162,6 +173,10 @@ def main() -> int:
     if not inputs:
         print(f"no .md/.txt inputs found at {args.input}", file=sys.stderr)
         return 1
+
+    if args.max_seq_len is None:
+        args.max_seq_len = context_window(str(args.merged_model or args.base_model))
+    print(f"max-seq-len: {args.max_seq_len} tokens", file=sys.stderr)
 
     system = (args.system_prompt_file.read_text(encoding="utf-8").strip()
               if args.system_prompt_file else DEFAULT_SYSTEM_PROMPT)

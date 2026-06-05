@@ -31,15 +31,35 @@ from rapidfuzz import fuzz
 from tqdm import tqdm
 
 from docx_to_markdown import convert_docx
+from model_utils import context_window
 from pdf_to_markdown import convert_pdf, make_converter
 from preprocess_protocol import clean_protocol, split_front_matter
 
 DEFAULT_SYSTEM_PROMPT = (
     "Du bist Protokollführer/in eines Ausschusses des Landtags Brandenburg. "
-    "Wandle das wörtliche Transkript einer Sitzung in ein formelles "
-    "Ausschussprotokoll im amtlichen Stil um. Nutze die Sprecher- und "
-    "Tagesordnungs-Markierungen, fasse die Beratung sachlich zusammen und gib "
-    "Beschlüsse und Abstimmungsergebnisse präzise wieder."
+    "Wandle das wörtliche Sitzungstranskript in ein formelles "
+    "Ausschussprotokoll im amtlichen Stil um.\n\n"
+    "Sprache und Stil:\n"
+    "- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem "
+    "Verwaltungsdeutsch.\n"
+    "- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten "
+    "Person wieder (z. B. „Er betont, dass …“, „Sie verweist darauf, dass …“).\n"
+    "- Nenne Sprecher/innen mit Name und Rolle/Fraktion, z. B. "
+    "„Kristy Augustin (CDU)“, „Steffen Freiberg (Minister für Bildung, Jugend "
+    "und Sport)“.\n\n"
+    "Formatierung:\n"
+    "- Gliedere nach Tagesordnungspunkten mit Überschriften „## Zu TOP N:“ "
+    "(Nummer aus den <SD-TOP>-Markierungen).\n"
+    "- Formuliere Beschlüsse als „Der [Gremium] beschließt einstimmig/"
+    "mehrheitlich (Ja : Nein : Enthaltungen) …“ und gib Abstimmungsergebnisse "
+    "stets als Tripel (Ja : Nein : Enthaltungen) an.\n"
+    "- Trenne, sofern vorhanden, Beschlüsse/Festlegungen von der "
+    "Zusammenfassung der Beratung („Aus der Beratung“).\n\n"
+    "Inhaltliche Treue:\n"
+    "- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde. Füge keine "
+    "Inhalte, Wertungen oder Fakten hinzu, die nicht im Transkript stehen, und "
+    "verändere oder verfälsche keine Aussagen.\n"
+    "- Im Zweifel knapper und näher am Wortlaut bleiben."
 )
 
 TOP_TAG_RE = re.compile(r"<SD-TOP>(.*?)</SD>", re.DOTALL)
@@ -56,6 +76,18 @@ PROT_ANLAGE_RE = re.compile(r"(?im)^##\s*Anlage")
 def approx_tokens(text: str) -> int:
     """Cheap whitespace token estimate (avoids loading a tokenizer)."""
     return len(text.split())
+
+
+def seq_tokens(tokenizer, messages: list[dict]) -> int:
+    """Real token length of the full chat record (system+user+assistant), used to
+    exclude examples that would not fit the model context window.
+
+    ``return_dict=True`` so we get a list of ids; the bare ``tokenize=True`` form
+    returns a BatchEncoding whose ``len`` is the number of keys (2), not tokens.
+    """
+    enc = tokenizer.apply_chat_template(messages, tokenize=True,
+                                        add_generation_prompt=False, return_dict=True)
+    return len(enc["input_ids"])
 
 
 def normalise_stem(stem: str) -> str:
@@ -212,6 +244,13 @@ def main() -> int:
                    help="Min fuzzy score to accept a transcript/protocol pair (default: 90)")
     p.add_argument("--marker", default=r"(?i)zu\s+TOP\s*1\b",
                    help="Protocol body-start marker regex")
+    p.add_argument("--base-model", default="google/gemma-4-31B-it",
+                   help="Model whose tokenizer + context window decide token counts and the "
+                        "length exclusion (default: google/gemma-4-31B-it)")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="Max record length in real tokens; longer records are EXCLUDED (not "
+                        "truncated) and recorded in --exclusions. Default: the base model's "
+                        "context window (auto-detected).")
     p.add_argument("--system-prompt-file", type=Path, default=None,
                    help="File with a custom system prompt (default: built-in German prompt)")
     p.add_argument("--seed", type=int, default=42,
@@ -223,10 +262,18 @@ def main() -> int:
                    help="Overwrite existing train.jsonl / val.jsonl")
     args = p.parse_args()
 
-    excluded: dict[str, set[int]] = {}
-    if args.exclusions:
+    excluded: dict[str, set] = {}
+    if args.exclusions and args.exclusions.exists():
         raw = json.loads(args.exclusions.read_text(encoding="utf-8"))
         excluded = {k: set(v) for k, v in raw.items()}
+
+    if args.max_seq_len is None:
+        args.max_seq_len = context_window(args.base_model)
+    print(f"max-seq-len: {args.max_seq_len} tokens (base {args.base_model})", file=sys.stderr)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    # length-based exclusions discovered during this build (merged into exclusions.json)
+    length_excluded: dict[str, set] = {}
 
     for d in (args.transcript_dir, args.protocol_dir):
         if not d.is_dir():
@@ -269,6 +316,17 @@ def main() -> int:
             continue
 
         recs: list[dict] = []
+
+        def consider(rec: dict, label) -> None:
+            """Keep the record unless it exceeds the context window; over-length
+            records are excluded (not truncated) and recorded for exclusions.json."""
+            st = seq_tokens(tokenizer, rec["messages"])
+            rec["meta"]["seq_tokens"] = st
+            if st > args.max_seq_len:
+                length_excluded.setdefault(key, set()).add(label)
+            else:
+                recs.append(rec)
+
         if args.granularity == "per-top":
             tx_tops = split_transcript_by_top(transcript)
             pr_tops = split_protocol_by_top(protocol)
@@ -280,20 +338,20 @@ def main() -> int:
                 if approx_tokens(pr_tops[n]) < args.min_tgt_tokens:
                     dropped += 1
                     continue
-                recs.append(make_record(system, tx_tops[n], pr_tops[n],
-                                        {"stem": key, "top": n, "strategy": "per-top"}))
+                consider(make_record(system, tx_tops[n], pr_tops[n],
+                                     {"stem": key, "top": n, "strategy": "per-top"}), n)
             if not common:  # alignment genuinely failed -> whole-document fallback
                 print(f"  no aligned TOPs for {tx_path.name}; document fallback",
                       file=sys.stderr)
-                recs.append(make_record(system, transcript, protocol,
-                                        {"stem": key, "strategy": "document-fallback"}))
+                consider(make_record(system, transcript, protocol,
+                                     {"stem": key, "strategy": "document-fallback"}), "document")
             elif not recs:  # had aligned TOPs but all excluded/short -> contribute nothing
                 print(f"  all aligned TOPs filtered for {tx_path.name}; skipped",
                       file=sys.stderr)
         else:
             if approx_tokens(protocol) >= args.min_tgt_tokens:
-                recs.append(make_record(system, transcript, protocol,
-                                        {"stem": key, "strategy": "document"}))
+                consider(make_record(system, transcript, protocol,
+                                     {"stem": key, "strategy": "document"}), "document")
         sessions.setdefault(key, []).extend(recs)
 
     sessions = {k: v for k, v in sessions.items() if v}
@@ -325,18 +383,36 @@ def main() -> int:
                 else:
                     n_train += 1
 
+    len_excluded_n = sum(len(v) for v in length_excluded.values())
     tgt_tok = [r["meta"]["tgt_tokens"] for v in sessions.values() for r in v]
     src_tok = [r["meta"]["src_tokens"] for v in sessions.values() for r in v]
+    seq_tok = [r["meta"]["seq_tokens"] for v in sessions.values() for r in v]
     print("\n=== dataset summary ===", file=sys.stderr)
     print(f"sessions: {len(keys)} ({len(val_keys)} val)", file=sys.stderr)
     print(f"records:  {n_train} train, {n_val_recs} val "
-          f"(dropped {dropped} short, {excluded_n} excluded)", file=sys.stderr)
+          f"(dropped {dropped} short, {excluded_n} speaker-excluded, "
+          f"{len_excluded_n} length-excluded > {args.max_seq_len} tokens)", file=sys.stderr)
     if src_tok:
         print(f"src tokens (approx): min {min(src_tok)} / "
               f"median {sorted(src_tok)[len(src_tok)//2]} / max {max(src_tok)}", file=sys.stderr)
         print(f"tgt tokens (approx): min {min(tgt_tok)} / "
               f"median {sorted(tgt_tok)[len(tgt_tok)//2]} / max {max(tgt_tok)}", file=sys.stderr)
+        print(f"seq tokens (real):   min {min(seq_tok)} / "
+              f"median {sorted(seq_tok)[len(seq_tok)//2]} / max {max(seq_tok)}", file=sys.stderr)
     print(f"wrote {train_path} and {val_path}", file=sys.stderr)
+
+    # Merge length exclusions into the exclusions file (union with speaker-based
+    # exclusions). Records over the context window are excluded, not truncated.
+    if length_excluded:
+        merged: dict[str, set] = {k: set(v) for k, v in excluded.items()}
+        for k, v in length_excluded.items():
+            merged.setdefault(k, set()).update(v)
+        excl_path = args.exclusions or (args.out_dir / "exclusions.json")
+        excl_path.write_text(
+            json.dumps({k: sorted(v, key=lambda x: (isinstance(x, str), x))
+                        for k, v in sorted(merged.items())},
+                       ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"merged {len_excluded_n} length exclusion(s) into {excl_path}", file=sys.stderr)
 
     return 2 if failures else 0
 
