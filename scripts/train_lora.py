@@ -7,8 +7,9 @@ masked so loss is computed only on the protocol completion.
 
 Real runs use 16-bit LoRA (``--bits 16``, the default) which fits gemma-4-31B-it
 on a single 80 GB H100; 4-bit QLoRA (``--bits 4``) is the smoke-test shortcut.
-Adapters are auto-named ``results/YYYYMMDD_XX_lora`` with a matching
-``results/YYYYMMDD_XX_log.md`` of the run parameters (smoke runs go to
+Each run is a self-contained, timestamp-named folder ``results/YYYYMMDD-HHMMSS/``
+holding the adapter, tokenizer and a ``train_log.md`` of the run parameters (base
+model and dataset live in the log content, not the folder name; smoke runs go to
 ``results/smoke_lora``); pass ``--out-dir`` to override. Training is logged to
 TensorBoard under ``results/tensorboard``; with a validation set, the best model
 is kept via early stopping. The adapter + tokenizer are written for
@@ -24,7 +25,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from model_utils import context_window, next_adapter_stamp
+from model_utils import context_window
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,19 +134,22 @@ def build_model_and_tokenizer(args: argparse.Namespace):
 
 
 def resolve_output(args: argparse.Namespace) -> tuple[Path, Path | None]:
-    """Decide the adapter dir and (optional) sibling log path.
+    """Decide the adapter dir and the log path written *inside* it.
 
-    explicit --out-dir -> use it + ``<dir>_log.md``; 4-bit -> results/smoke_lora
-    (no dated log); 16-bit -> results/YYYYMMDD_XX_lora + results/YYYYMMDD_XX_log.md.
+    A run is a self-contained, timestamp-named folder ``results/YYYYMMDD-HHMMSS/``
+    (no model/variant in the name — those live in the log content) holding the
+    adapter, tokenizer and ``train_log.md``. explicit --out-dir -> use it (log
+    still goes inside as ``train_log.md``); 4-bit smoke -> results/smoke_lora.
     """
     results = Path("results")
     if args.out_dir is not None:
         out = args.out_dir
-        return out, out.parent / f"{out.name}_log.md"
+        return out, out / "train_log.md"
     if args.bits == 4:
-        return results / "smoke_lora", None
-    stamp = next_adapter_stamp(results, datetime.now().strftime("%Y%m%d"))
-    return results / f"{stamp}_lora", results / f"{stamp}_log.md"
+        out = results / "smoke_lora"
+        return out, out / "train_log.md"
+    out = results / datetime.now().strftime("%Y%m%d-%H%M%S")
+    return out, out / "train_log.md"
 
 
 def _git_commit() -> str:

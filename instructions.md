@@ -6,13 +6,17 @@ Approx VRAM for the 31B (seq 4096, batch 1, gradient checkpointing, AdamW-8bit, 
 
 Gemma 4 is multimodal (text+vision+audio), but `AutoModelForCausalLM` loads the text path and training is text-only. Two Gemma-specific settings are baked into `train_lora.py`: attention defaults to **`sdpa`** (no flash-attn build needed), and `--exclude-modules` drops the **vision/audio towers** (their projections share the `q_proj`/`k_proj` names but use a wrapper layer PEFT can't adapt). Both are no-ops for plain text models, so the script stays general.
 
-All paths below assume the corpus lives under **`data/`** (gitignored). Stages run in order; each writes a new sub-folder so you can inspect intermediates.
+All paths below assume the corpus lives under **`data/`** (gitignored, a real working dir). The raw delivery is read-only shared storage, symlinked in as **`data/raw`**; stage **A0** stages it into the flat layout the rest of the pipeline expects. Stages run in order; each writes a new sub-folder so you can inspect intermediates.
 
 ```
-data/protocols/pdf/                      raw protocol PDFs (input)
+data/raw/                                read-only symlink → shared corpus (nested Committee/[WP/]Session/)
+data/protocols/pdf/      <stem>_Protokoll.pdf   A0 → symlinks to raw protocol PDFs (input)
+data/transcripts/audio/  <stem>_Transkript.mp3  A0 → symlinks to raw session MP3s (input)
+data/transcripts/manifest.txt            A0 → staged audio paths of trainable sessions
+data/ingest_report.tsv                   A0 → per-session stem/flags audit
 data/protocols/md/                       A → markdown protocols
 data/protocols/md_clean/   (+ cover/)    A → cleaned bodies + separated cover pages
-data/transcripts/{wav,md}/               A → diarised transcripts (<SD-SPK>SPEAKER_NN, timestamps)
+data/transcripts/md/                     A → diarised transcripts (<SD-SPK>SPEAKER_NN, timestamps)
 data/transcripts/md_top/   (+ top_reports/)   B → transcripts with <SD-TOP> agenda tags
 data/transcripts/md_prepared/            B → speaker labels replaced with real names  ← dataset source
 data/speaker_maps/                       B → per-session resolution reports
@@ -31,6 +35,50 @@ results/summaries/                       E → generated protocols
 The SLURM launchers and the stage-B scripts source `.env` automatically. `.env` is gitignored; never commit it.
 
 
+## Running on SLURM (cluster specifics)
+
+The GPU sbatch scripts (`transcribe*.sbatch`, `train_lora.sbatch`) already set
+`--account=aisc --partition=aisc-batch`. You may use a different configuration on your cluster.
+
+CPU-only work (e.g. the optional `pdf_to_markdown.sbatch`) runs under the **`default`
+account + `normal` QOS** on `cpu-batch` (the `aisc` account/QOS is GPU-partitions
+only); those scripts set that themselves. `HF_HOME` defaults to shared project
+storage so large model downloads stay off the home quota. `uv sync` once to install.
+
+
+## A0. Ingest the raw corpus (stage the nested delivery → flat layout)
+
+The delivered corpus is nested `Committee/[Wahlperiode/]Session/` folders, each
+with a protocol **PDF** + a session **MP3** and inconsistent file names. Point
+`data/raw` at it once:
+
+```bash
+ln -s /sc/projects/sci-aisc/pilotproject-automatic-protocols/data2 data/raw
+```
+
+`ingest_corpus.py` walks `data/raw`, derives a canonical session stem
+`<ABBR>[_<WP>]_<NN>` (committee abbreviation from the top folder's parens, optional
+Wahlperiode, sitting number) and creates **relative symlinks** into the flat
+layout — `data/protocols/pdf/<stem>_Protokoll.pdf` and
+`data/transcripts/audio/<stem>_Transkript.mp3` — plus `data/transcripts/manifest.txt`
+(audio of the trainable sessions, i.e. those with both a PDF and audio) and
+`data/ingest_report.tsv` (per-session audit with flags `MISSING_PDF` /
+`MISSING_AUDIO` / `MULTIPART(n)` / `COLLISION_WITH:…`).
+
+```bash
+uv run python scripts/ingest_corpus.py            # --dry-run to preview, --overwrite to re-link
+```
+
+Inspect `data/ingest_report.tsv` before converting — flagged rows are skipped from
+the manifest. Multi-part audio (e.g. `SLausitz_3`) is staged as
+`<stem>_Transkript.pt01.mp3`, `.pt02.mp3`, …; after transcription, merge the parts
+back into one transcript:
+
+```bash
+uv run python scripts/ingest_corpus.py --merge-parts --transcript-dir data/transcripts/md
+```
+
+
 ## A. Data conversion & cleaning
 
 All converters take `--input` (a file **or** a directory) and `--out-dir`, skip existing outputs unless `--overwrite`, and use exit codes 0/1/2.
@@ -38,6 +86,9 @@ All converters take `--input` (a file **or** a directory) and `--out-dir`, skip 
 ```bash
 # 1) protocol PDF → markdown (Docling, layout + table aware; OCR off, born-digital)
 uv run python scripts/pdf_to_markdown.py --input data/protocols/pdf --out-dir data/protocols/md
+#    Docling is memory-hungry; a full corpus OOM-kills on the login node. For many/large
+#    PDFs run it on a compute node instead (idempotent — skips already-converted files):
+#    INPUT=data/protocols/pdf OUT_DIR=data/protocols/md sbatch scripts/pdf_to_markdown.sbatch
 
 # 2) clean protocols: split off the cover (title/attendance/agenda) into md_clean/cover/,
 #    drop the Anlagen section, page-footer tables, <!-- image -->, hyperlinks and attachment
@@ -79,6 +130,8 @@ uv run python scripts/match_speakers.py \
 ```
 
 `data/transcripts/md_prepared/` are the **final transcripts** (with `<SD-TOP>` tags and full names; any unresolved speaker stays `SPEAKER_NN`). Useful flags (both scripts): `--concurrency N` (parallel sessions), `--max-tokens` (completion budget incl. reasoning — raise if you see a *truncated/empty* warning), `--llm-model`, `--llm-base-url`, `--no-llm`. For `match_speakers.py`: `--max-unresolved-sentences N` excludes a TOP only if an unidentified speaker exceeds N sentences (default 2); `--content-threshold`.
+
+> **TOP boundaries (B1):** `tag_transcript_tops.py` also handles two tricky cases. Jointly-handled items ("TOP 4 gemeinsam mit TOP 5") may share an anchor instead of being mis-placed; and when one turn both *closes* the previous TOP (vote / "ich schließe den Tagesordnungspunkt") and *opens* the next, a follow-up LLM call splits the turn at the right segment line so the closing/vote stays with the previous TOP (both halves keep the speaker). Disable with `--no-boundary-split`.
 
 Inspect `data/speaker_maps/*.json` (per-label name + method + conflicts) and `data/transcripts/md_top/top_reports/*.json` (cover vs. found TOPs) before building the dataset.
 
@@ -127,6 +180,8 @@ Scale up to the 31B with `BASE_MODEL=google/gemma-4-31B-it`. `HF_HOME` defaults 
 Key `train_lora.py` flags: `--bits {4,16}`, `--lora-r/--lora-alpha/--lora-dropout`, `--target-modules`/`--exclude-modules`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--packing`, `--attn {sdpa,flash_attention_2,eager}`.
 
 > **Watch the sequence length:** per-TOP records with timestamps can exceed `MAX_SEQ_LEN=4096` real tokens and get truncated (losing part of the target). Raise `--max-seq-len` (e.g. 8192) for long sessions.
+>
+> **But cap it on the 31B:** gemma-4-31B-it has a ~256k-token vocabulary, so the loss step materialises a `seq_len × vocab` logits tensor on one device. With the default `sdpa` attention this OOMs a single 80 GB H100 well before the model's context window — roughly **≤16k comfortable, ~32k borderline, >40k OOM**. So do **not** train uncapped (`--max-seq-len` = context window); build the dataset and train with an explicit cap (e.g. `MAX_SEQ_LEN=32768`). `build_dataset.py --max-seq-len N` length-excludes (and logs) over-long records rather than truncating, keeping the two sides aligned. flash-attn would relax the *attention* memory but not the logits tensor.
 
 
 ## E. Inference (GPU / SLURM)

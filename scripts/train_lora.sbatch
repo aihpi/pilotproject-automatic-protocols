@@ -35,6 +35,7 @@ MAX_STEPS="${MAX_STEPS:--1}"   # set e.g. 5 for a quick smoke test
 # (cross-contamination). Only set PACKING=1 together with a flash-attention
 # build + --attn flash_attention_2, which masks packed samples correctly.
 PACKING="${PACKING:-0}"
+ATTN="${ATTN:-}"               # e.g. flash_attention_2 (needs flash-attn) for long sequences
 
 export PATH="$HOME/.local/bin:$PATH"
 # Keep large model downloads off the home quota (shared project storage).
@@ -52,6 +53,9 @@ out_arg=()
 seqlen_arg=()
 [ -n "$MAX_SEQ_LEN" ] && seqlen_arg=(--max-seq-len "$MAX_SEQ_LEN")
 
+attn_arg=()
+[ -n "$ATTN" ] && attn_arg=(--attn "$ATTN")
+
 uv run python scripts/train_lora.py \
     --train-jsonl  "$TRAIN_JSONL" \
     "${val_arg[@]}" \
@@ -59,6 +63,7 @@ uv run python scripts/train_lora.py \
     "${out_arg[@]}" \
     --bits         "$BITS" \
     "${seqlen_arg[@]}" \
+    "${attn_arg[@]}" \
     --epochs       "$EPOCHS" \
     --max-steps    "$MAX_STEPS" \
     "${pack_arg[@]}"

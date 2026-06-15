@@ -14,8 +14,11 @@ its discussion begins. Long transcripts are processed in windows; sessions run i
 ``--no-llm`` (or a missing key) falls back to a transition-verb-gated regex.
 
 ``<SD-TOP>TOP N</SD>`` is inserted before the assigned turn's ``<SD-SPK>`` so the per-TOP
-slice keeps that turn's speaker. Verification per session (printed + JSON report): cover vs
-transcript TOP counts and which TOPs appear on only one side.
+slice keeps that turn's speaker. When a single turn both *closes* the previous item (e.g. a
+vote) and *opens* the next, a follow-up LLM call splits it at the right segment line so the
+closing stays with the previous TOP (``refine_boundaries``; both halves keep the speaker;
+disable with ``--no-boundary-split``). Verification per session (printed + JSON report): cover
+vs transcript TOP counts and which TOPs appear on only one side.
 """
 
 from __future__ import annotations
@@ -46,6 +49,14 @@ _NOT_AGENDA_TITLE_RE = re.compile(r"^(\(|\d|(?i:\(?(teilweise\s+)?(öffentlich|n
 
 TURN_TEXT_CAP = 300   # chars of each turn shown to the LLM
 ANCHOR_CAP = 400      # chars of each protocol section used as an anchor
+# Cheap pre-filter for a TOP-opening turn that FIRST closes the previous item (vote
+# result / "ich schließe den Tagesordnungspunkt"); only such boundary turns are sent
+# to the LLM for a sub-turn split (refine_boundaries), so the closing stays with the
+# previous TOP instead of bleeding into the new one.
+CLOSE_CUE_RE = re.compile(
+    r"(?i)(schließ\w*\b[^.]{0,40}\btagesordnungspunkt|"
+    r"\bdamit\b[^.]{0,50}\b(abgelehnt|angenommen|beschlossen|abgestimmt)|"
+    r"\btagesordnungspunkt\b[^.]{0,20}\bgeschlossen)")
 
 
 def _is_agenda_title(title: str) -> bool:
@@ -155,8 +166,11 @@ def _top_prompt(agenda: dict[int, str], anchors: dict[int, str],
         "Wird ein Punkt nicht ausdrücklich aufgerufen (z.B. wenn die Sitzung direkt mit dem "
         "Thema beginnt oder es nur narrativ eingeleitet wird), wähle den Turn, in dem das "
         "Thema (vgl. Protokoll-Anker) erstmals behandelt wird. Die Turn-Indizes müssen mit "
-        "steigender TOP-Nummer nicht-fallend sein. Gib null NUR, wenn der Punkt in den "
-        "gezeigten Turns gar nicht vorkommt (etwa der nichtöffentliche Teil).",
+        "steigender TOP-Nummer nicht-fallend sein. Werden mehrere Punkte ausdrücklich "
+        "GEMEINSAM aufgerufen oder behandelt (z.B. „TOP 4, den wir gemeinsam mit TOP 5 "
+        "behandeln“), weise allen gemeinsam behandelten Punkten DENSELBEN Turn-Index zu. "
+        "Gib null NUR, wenn der Punkt in den gezeigten Turns gar nicht vorkommt (etwa der "
+        "nichtöffentliche Teil).",
         "", "OFFENE TAGESORDNUNGSPUNKTE:"]
     for n in pending:
         anchor = anchors.get(n, "")
@@ -172,16 +186,27 @@ def _top_prompt(agenda: dict[int, str], anchors: dict[int, str],
 
 def detect_tops_llm(client, model: str, agenda: dict[int, str], anchors: dict[int, str],
                     turns: list[dict], token_budget: int, max_tokens: int) -> dict[int, int]:
-    """Global single-pass assignment with a windowed fallback for long transcripts."""
+    """Assign each agenda TOP the turn where its discussion begins: ``{top: turn}``.
+
+    Turn indices are non-decreasing in TOP order, and jointly-handled items
+    ("TOP 4 gemeinsam mit TOP 5") may share a turn (ties allowed). Long transcripts
+    are processed in *tiled* windows — the next window starts where the last ended,
+    so turns are never skipped and an earlier item is not stranded when a later one
+    is found first (the old code advanced past ``max(found)+1``, which mis-anchored a
+    folded item onto a later turn). An item the model cannot place stays unassigned
+    (precision over recall) rather than being forced onto a wrong turn.
+    """
     found: dict[int, int] = {}
-    pending = sorted(agenda)
-    base = llm_utils.estimate_tokens(_top_prompt(agenda, anchors, pending, []))
+    base = llm_utils.estimate_tokens(_top_prompt(agenda, anchors, sorted(agenda), []))
+    floor = 0            # non-decreasing lower bound for accepted turn indices
     start = 0
-    while pending and start < len(turns):
+    n = len(turns)
+    while start < n and len(found) < len(agenda):
+        pending = [t for t in sorted(agenda) if t not in found]
         window: list[tuple[int, dict]] = []
         toks = base
         i = start
-        while i < len(turns):
+        while i < n:
             t_tok = llm_utils.estimate_tokens(turns[i]["text"][:TURN_TEXT_CAP]) + 8
             if window and toks + t_tok > token_budget:
                 break
@@ -191,28 +216,109 @@ def detect_tops_llm(client, model: str, agenda: dict[int, str], anchors: dict[in
         res = llm_utils.chat_json(client, model,
                                   _top_prompt(agenda, anchors, pending, window),
                                   max_tokens=max_tokens)
-        progressed = False
+        proposed: dict[int, int] = {}            # top -> turn, from this window's answer
         for k, v in res.items():
-            km = re.search(r"\d+", str(k))           # accept "1", "TOP 1", "TOP1"
+            km = re.search(r"\d+", str(k))        # accept "1", "TOP 1", "TOP1"
             vm = re.search(r"\d+", str(v)) if v is not None else None  # "6", "T6", null
-            if not km:
-                continue
-            top = int(km.group())
-            ti = int(vm.group()) if vm else None
-            if top in agenda and top not in found and ti is not None and start <= ti < i:
+            if km and vm:
+                proposed[int(km.group())] = int(vm.group())
+        # Accept in ascending TOP order so the non-decreasing floor (which allows
+        # ties for jointly-handled items) is applied consistently.
+        for top in pending:
+            ti = proposed.get(top)
+            if ti is not None and start <= ti < i and ti >= floor:
                 found[top] = ti
-                progressed = True
-        pending = [n for n in sorted(agenda) if n not in found]
-        if i >= len(turns):
-            break  # whole transcript seen in this window
-        start = (max(found.values()) + 1) if progressed else i
+                floor = ti
+        if i >= n:
+            break  # reached the end of the transcript
+        start = i  # tile forward; never skip turns
     return found
+
+
+# --------------------------------------------------------------- boundary refinement
+
+BOUNDARY_SPLIT_PROMPT = (
+    "Du erhältst einen einzelnen Redebeitrag aus einem Ausschusstranskript, der genau an "
+    "einer Tagesordnungspunkt-(TOP)-Grenze liegt, als nummerierte Zeilen (Wortsegmente, ab 1). "
+    "Am Anfang wird ggf. noch der VORHERIGE TOP abgeschlossen (Abstimmungsergebnis, "
+    "„ich schließe den Tagesordnungspunkt“), danach der NÄCHSTE TOP aufgerufen oder eingeleitet. "
+    "Gib als JSON die Nummer der LETZTEN Zeile zurück, die noch zum VORHERIGEN TOP gehört; alle "
+    "folgenden Zeilen gehören zum neuen TOP. Beginnt der Beitrag direkt mit dem neuen TOP "
+    "(kein vorheriger Inhalt), gib 0. Format: {\"last_prev_line\": N}.")
+
+
+def _seg_text(line: str) -> str:
+    m = SEG_LINE_RE.match(line.strip())
+    return m.group(1).strip() if m else ""
+
+
+def _segment_lines(turn: dict) -> list[str]:
+    """The turn's verbatim timestamped segment lines (excludes the <SD-SPK> line/blanks)."""
+    return [ln for ln in turn["lines"][1:] if _seg_text(ln)]
+
+
+def refine_boundaries(turns: list[dict], top_to_turn: dict[int, int], *,
+                      client, model: str, max_tokens: int) -> tuple[list[dict], dict[int, int]]:
+    """Split boundary turns so a closing/vote stays with the PREVIOUS TOP.
+
+    For each TOP-opening turn that also closes the previous item (cheap CLOSE_CUE
+    pre-filter), the LLM marks the last segment line still belonging to the previous
+    TOP; the turn is split there into two **same-speaker** sub-turns and the
+    ``<SD-TOP>`` tag moves before the second (new-TOP) half. Both halves keep the
+    original ``<SD-SPK>`` line, so the speaker is preserved on each side of the split.
+    Returns ``(new_turns, new_top_to_turn)``.
+    """
+    opening = sorted(top_to_turn.items(), key=lambda kv: kv[1])   # (top, turn_index)
+    split_at: dict[int, int] = {}                                 # turn_index -> #leading lines kept by prev TOP
+    for rank, (top, ti) in enumerate(opening):
+        if rank == 0:
+            continue                                              # first item: nothing precedes it
+        turn = turns[ti]
+        if not CLOSE_CUE_RE.search(turn["text"]):
+            continue
+        segs = _segment_lines(turn)
+        if len(segs) < 2:
+            continue
+        numbered = "\n".join(f"{i}. {_seg_text(l)}" for i, l in enumerate(segs, 1))
+        try:
+            res = llm_utils.chat_json(client, model,
+                                      BOUNDARY_SPLIT_PROMPT + "\n\nABSCHNITT:\n" + numbered,
+                                      max_tokens=max_tokens)
+            n = res.get("last_prev_line")
+        except Exception:
+            n = None
+        if isinstance(n, int) and 0 < n < len(segs):
+            split_at[ti] = n
+    if not split_at:
+        return turns, top_to_turn
+
+    ti_to_top = {ti: top for top, ti in top_to_turn.items()}
+    new_turns: list[dict] = []
+    remap: dict[int, int] = {}
+    for i, turn in enumerate(turns):
+        if i in split_at:
+            n = split_at[i]
+            spk = turn["lines"][0]
+            segs = _segment_lines(turn)
+            prev_half = {"label": turn["label"], "lines": [spk] + segs[:n],
+                         "text": " ".join(_seg_text(l) for l in segs[:n])}
+            new_half = {"label": turn["label"], "lines": [spk] + segs[n:],
+                        "text": " ".join(_seg_text(l) for l in segs[n:])}
+            new_turns.append(prev_half)                           # stays with the previous TOP
+            if i in ti_to_top:
+                remap[ti_to_top[i]] = len(new_turns)              # tag moves before the new half
+            new_turns.append(new_half)
+        else:
+            new_turns.append(turn)
+            if i in ti_to_top:
+                remap[ti_to_top[i]] = len(new_turns) - 1
+    return new_turns, remap
 
 
 # ------------------------------------------------------------------------- per session
 
 def process_pair(tpath: Path, ppath: Path, *, use_llm: bool, client, model: str,
-                 token_budget: int, max_tokens: int) -> dict:
+                 token_budget: int, max_tokens: int, refine_bounds: bool = True) -> dict:
     ptext = ppath.read_text(encoding="utf-8")
     cover, _b, matched = split_cover(ptext)
     agenda = parse_agenda(cover if matched else ptext)
@@ -222,6 +328,9 @@ def process_pair(tpath: Path, ppath: Path, *, use_llm: bool, client, model: str,
     if use_llm and agenda:
         top_to_turn = detect_tops_llm(client, model, agenda, _protocol_anchors(ptext),
                                       turns, token_budget, max_tokens)
+        if refine_bounds:
+            turns, top_to_turn = refine_boundaries(turns, top_to_turn, client=client,
+                                                   model=model, max_tokens=max_tokens)
     else:
         top_to_turn = detect_tops_regex(turns)
     tagged, found = rebuild(front, preamble, turns, top_to_turn)
@@ -267,6 +376,10 @@ def main() -> int:
                    help="Approx prompt-token budget before windowing (default: 24000)")
     p.add_argument("--max-tokens", type=int, default=llm_utils.DEFAULT_MAX_TOKENS,
                    help=f"Completion budget incl. reasoning (default: {llm_utils.DEFAULT_MAX_TOKENS})")
+    p.add_argument("--no-boundary-split", action="store_true",
+                   help="Skip the LLM sub-turn split at TOP boundaries (otherwise a turn that "
+                        "closes the previous TOP and opens the next is split so the closing/vote "
+                        "stays with the previous TOP; LLM-only).")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -296,7 +409,8 @@ def main() -> int:
         pairs,
         lambda pr: process_pair(pr[0], pr[1], use_llm=use_llm, client=client,
                                 model=args.llm_model, token_budget=args.token_budget,
-                                max_tokens=args.max_tokens),
+                                max_tokens=args.max_tokens,
+                                refine_bounds=not args.no_boundary_split),
         args.concurrency)
 
     failures = 0

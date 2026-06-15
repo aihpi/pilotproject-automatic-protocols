@@ -36,7 +36,7 @@ from pdf_to_markdown import convert_pdf, make_converter
 from preprocess_protocol import clean_protocol, split_front_matter
 
 DEFAULT_SYSTEM_PROMPT = (
-    "Du bist Protokollführer/in eines Ausschusses des Landtags Brandenburg. "
+    "Du bist Protokollführer/in eines Ausschusses. "
     "Wandle das wörtliche Sitzungstranskript in ein formelles "
     "Ausschussprotokoll im amtlichen Stil um.\n\n"
     "Sprache und Stil:\n"
@@ -236,6 +236,11 @@ def main() -> int:
                    help="Output directory for train.jsonl / val.jsonl (default: data/train)")
     p.add_argument("--granularity", choices=("document", "per-top"), default="per-top",
                    help="Segmentation strategy (default: per-top)")
+    p.add_argument("--include-untagged-as-document", action="store_true",
+                   help="per-top only: sessions with no aligned TOPs (e.g. single-TOP budget "
+                        "sittings B1 couldn't anchor) are SKIPPED by default and logged to "
+                        "<out-dir>/untagged_sessions.json. Pass this to instead include each such "
+                        "session as one whole-document record (still subject to --min-tgt-tokens).")
     p.add_argument("--val-frac", type=float, default=0.1,
                    help="Fraction of sessions held out for validation (default: 0.1)")
     p.add_argument("--min-tgt-tokens", type=int, default=32,
@@ -304,6 +309,7 @@ def main() -> int:
     sessions: dict[str, list[dict]] = {}
     dropped = 0
     excluded_n = 0
+    untagged: list[str] = []  # sessions with no aligned TOPs (logged; included only on flag)
     failures: list[tuple[str, str]] = []
     for tx_path, pr_path in tqdm(pairs, desc="build", unit="pair"):
         key = normalise_stem(tx_path.stem)
@@ -340,11 +346,19 @@ def main() -> int:
                     continue
                 consider(make_record(system, tx_tops[n], pr_tops[n],
                                      {"stem": key, "top": n, "strategy": "per-top"}), n)
-            if not common:  # alignment genuinely failed -> whole-document fallback
-                print(f"  no aligned TOPs for {tx_path.name}; document fallback",
-                      file=sys.stderr)
-                consider(make_record(system, transcript, protocol,
-                                     {"stem": key, "strategy": "document-fallback"}), "document")
+            if not common:  # no aligned TOPs located in this session
+                untagged.append(key)
+                if args.include_untagged_as_document and \
+                        approx_tokens(protocol) >= args.min_tgt_tokens:
+                    print(f"  no aligned TOPs for {tx_path.name}; including as whole document",
+                          file=sys.stderr)
+                    consider(make_record(system, transcript, protocol,
+                                         {"stem": key, "strategy": "document-fallback"}), "document")
+                else:
+                    why = ("excluded by default" if not args.include_untagged_as_document
+                           else "skipped: target too short")
+                    print(f"  no aligned TOPs for {tx_path.name}; {why} "
+                          f"(logged to untagged_sessions.json)", file=sys.stderr)
             elif not recs:  # had aligned TOPs but all excluded/short -> contribute nothing
                 print(f"  all aligned TOPs filtered for {tx_path.name}; skipped",
                       file=sys.stderr)
@@ -400,6 +414,15 @@ def main() -> int:
         print(f"seq tokens (real):   min {min(seq_tok)} / "
               f"median {sorted(seq_tok)[len(seq_tok)//2]} / max {max(seq_tok)}", file=sys.stderr)
     print(f"wrote {train_path} and {val_path}", file=sys.stderr)
+
+    if untagged:
+        uniq = sorted(set(untagged))
+        (args.out_dir / "untagged_sessions.json").write_text(
+            json.dumps(uniq, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        action = ("included as whole documents" if args.include_untagged_as_document
+                  else "EXCLUDED (pass --include-untagged-as-document to keep)")
+        print(f"untagged sessions (no aligned TOPs): {len(uniq)} {action}; "
+              f"logged to {args.out_dir / 'untagged_sessions.json'}", file=sys.stderr)
 
     # Merge length exclusions into the exclusions file (union with speaker-based
     # exclusions). Records over the context window are excluded, not truncated.

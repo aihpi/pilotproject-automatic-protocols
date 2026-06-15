@@ -15,8 +15,6 @@ dependencies = [
     # gated pyannote/speaker-diarization-community-1 repo, so request access to it
     # (and accept segmentation-3.0) on HuggingFace before using --diarize.
     "pyannote.audio>=4.0",
-    # Example-data video download (scripts/example_data/download.py); 3Q SDN extractor
-    "yt-dlp>=2024.0.0",
     # Document conversion (transcript .docx / protocol .pdf -> markdown)
     "docling>=2.0.0",
     # Headless OpenCV: the cluster has no libGL, so the default opencv-python

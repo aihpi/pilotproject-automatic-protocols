@@ -192,10 +192,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 
-# Data: the symlinked shared-storage trees (data, data_old) and all locally-built
-# example datasets (data_example01, data_example02, …). Never committed — videos are
+# Data: the working tree (data/ — its data/raw symlink points at the read-only
+# shared corpus) and all locally-built example datasets. Never committed — audio is
 # multi-GB and the corpus is not redistributable. Matches any root-level "data*".
 /data*
+# Retired/reference trees moved out of the root (data_old, example datasets).
+/archive/
 logs/
 # Training outputs (adapters) and generated summaries
 results/
