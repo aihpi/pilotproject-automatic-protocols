@@ -127,6 +127,11 @@ def gemma4_conditional_lce_forward(
             shift_labels=shift_labels,
             hidden_size=text_config.hidden_size,
             final_logit_softcapping=final_logit_softcapping,
+            # Accumulate the fused lm_head matmul + CE in fp32. The stock loss path
+            # upcasts logits to fp32 before cross-entropy; without this the fused
+            # bf16 backward overflows -> NaN grads -> divergence (loss ~1e7). Harmless
+            # for the 4-bit path (already stable). See module docstring.
+            accum_dtype=torch.float32,
             **kwargs,
         )
         loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
