@@ -288,6 +288,10 @@ def main() -> int:
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
+        # Match eval batch to train (default is 8): at long --max-seq-len, 8 sequences in
+        # one eval forward OOMs GPU 0 even though batch-1 training fits. (Eval has no
+        # gradient accumulation, so this just sets the eval forward batch.)
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type=args.lr_scheduler,
