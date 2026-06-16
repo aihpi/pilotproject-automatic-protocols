@@ -41,6 +41,7 @@ from liger_kernel.transformers.model.loss_utils import (
     LigerForCausalLMLoss,
     unpack_cross_entropy_result,
 )
+from liger_kernel.transformers.model.output_classes import LigerCausalLMOutputWithPast
 
 
 def gemma4_conditional_lce_forward(
@@ -68,7 +69,12 @@ def gemma4_conditional_lce_forward(
     linear cross-entropy. Signature mirrors the stock forward so the Trainer/PEFT call
     it unchanged; the only added kwarg is ``skip_logits`` (force the fused path on/off).
     """
-    from transformers.models.gemma4.modeling_gemma4 import Gemma4CausalLMOutputWithPast
+    # The stock forward is wrapped by @can_return_tuple, which strips `return_dict`
+    # from kwargs before the body runs; replacing .forward with a plain function loses
+    # that, so a caller-injected `return_dict` would collide with the explicit
+    # return_dict=True below. Drop it — we always return the ModelOutput (it indexes
+    # like a tuple, so callers requesting a tuple still work).
+    kwargs.pop("return_dict", None)
 
     # Identical to the stock wrapper forward — run the multimodal model body.
     outputs = self.model(
@@ -100,6 +106,8 @@ def gemma4_conditional_lce_forward(
     final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
     loss = None
     logits = None
+    token_accuracy = None
+    predicted_tokens = None
 
     # Fuse lm_head + CE whenever a loss is wanted (train AND eval), so the full
     # seq×vocab logits tensor is never materialised. See module docstring.
@@ -110,6 +118,8 @@ def gemma4_conditional_lce_forward(
         # Raw-weight matmul has no device hook: align hidden states to the (tied)
         # lm_head weight's device under device_map="auto".
         kept_hidden_states = kept_hidden_states.to(self.lm_head.weight.device)
+        # TRL (use_liger_kernel) passes return_token_accuracy=True via **kwargs; the
+        # fused kernel returns it so the trainer can log mean_token_accuracy.
         result = LigerForCausalLMLoss(
             hidden_states=kept_hidden_states,
             lm_head_weight=self.lm_head.weight,
@@ -119,7 +129,7 @@ def gemma4_conditional_lce_forward(
             final_logit_softcapping=final_logit_softcapping,
             **kwargs,
         )
-        loss = unpack_cross_entropy_result(result)[0]
+        loss, _, token_accuracy, predicted_tokens = unpack_cross_entropy_result(result)
     else:
         # Generation / explicit skip_logits=False: stock full-logits path.
         logits = self.lm_head(kept_hidden_states)
@@ -130,15 +140,17 @@ def gemma4_conditional_lce_forward(
         if labels is not None:
             loss = self.loss_function(logits, labels, text_config.vocab_size, **kwargs)
 
-    return Gemma4CausalLMOutputWithPast(
+    # Return liger's output class (carries token_accuracy, which TRL reads under
+    # use_liger_kernel). The gemma4-specific multimodal fields (image/audio/
+    # shared_kv_states) are unused for text-only LoRA train/eval.
+    return LigerCausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        image_hidden_states=outputs.image_hidden_states,
-        audio_hidden_states=outputs.audio_hidden_states,
-        shared_kv_states=outputs.shared_kv_states,
+        token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens,
     )
 
 

@@ -294,6 +294,12 @@ def main() -> int:
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         bf16=True,
+        # Tell TRL the model uses a liger fused-CE forward (logits may be None): it then
+        # skips its logits-based metric path in compute_loss and reads token_accuracy
+        # from the output instead. The actual fused forward is installed in
+        # build_model_and_tokenizer; transformers' own liger application is a no-op for
+        # the gemma4 multimodal type, so this flag only flips TRL's loss path.
+        use_liger_kernel=args.use_liger,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
