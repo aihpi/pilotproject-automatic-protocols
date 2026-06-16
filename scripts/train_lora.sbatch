@@ -41,6 +41,11 @@ export PATH="$HOME/.local/bin:$PATH"
 # Keep large model downloads off the home quota (shared project storage).
 export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocols/hf-cache}"
 
+# Reduce CUDA allocator fragmentation. The OOM logs show several GiB "reserved but
+# unallocated" on GPU 0; expandable_segments lets the allocator reuse it instead of
+# failing a large contiguous alloc. Cheap, no downside; the runtime suggests it.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Liger kernels use Triton, which JIT-compiles a small CUDA helper that #includes
 # Python.h. The cluster's system python3.12 has no dev headers, so expose the
 # uv-managed standalone CPython 3.12 headers to gcc via CPATH.

@@ -113,23 +113,33 @@ def build_model_and_tokenizer(args: argparse.Namespace):
 
     if args.use_liger:
         # Patch the model CLASS *before* loading so the instance uses Liger's
-        # lce_forward: it fuses the lm_head matmul with cross-entropy in chunks and
-        # never materialises the full seq×vocab logits tensor (the OOM at long
-        # --max-seq-len on large-vocab models like gemma-4). The transformers
+        # fused-linear-CE forward: it fuses the lm_head matmul with cross-entropy in
+        # chunks and never materialises the full seq×vocab logits tensor (the OOM at
+        # long --max-seq-len on large-vocab models like gemma-4). The transformers
         # `use_liger_kernel` flag only swaps the cheap kernels on the *instance* and
         # leaves the standard full-logits loss path, so we apply it ourselves here.
         from transformers import AutoConfig
         from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
         cfg = AutoConfig.from_pretrained(args.base_model)
-        mt = getattr(getattr(cfg, "text_config", None), "model_type", None) or cfg.model_type
+        text_cfg = getattr(cfg, "text_config", None)
+        mt = getattr(text_cfg, "model_type", None) or cfg.model_type
         apply_fn = MODEL_TYPE_TO_APPLY_LIGER_FN.get(mt)
         if apply_fn is None:
             print(f"liger: no kernel for model_type={mt}; using standard loss "
                   "(long sequences may OOM)", file=sys.stderr)
         else:
+            # Installs liger's cheap kernels (RMSNorm/GEGLU/rope) on the text modules
+            # AND its fused-CE forward on the *text* class (e.g. Gemma4ForCausalLM).
             apply_fn(fused_linear_cross_entropy=True, cross_entropy=False)
             print(f"liger: fused-linear-CE patch applied for model_type={mt} "
                   "(lm_head+CE fused; full logits not materialised)", file=sys.stderr)
+        # gemma-4 loads as the multimodal wrapper Gemma4ForConditionalGeneration, which
+        # liger does NOT patch (it only patches the text-only Gemma4ForCausalLM) — its
+        # stock forward still materialises full logits. Patch the wrapper too so the
+        # fused path actually engages. See scripts/gemma4_liger_patch.py.
+        if cfg.model_type == "gemma4" and text_cfg is not None:
+            from gemma4_liger_patch import patch_gemma4_conditional_generation
+            patch_gemma4_conditional_generation()
 
     print(f"loading {args.base_model} (bits={args.bits}, attn={args.attn})",
           file=sys.stderr, flush=True)
@@ -292,6 +302,10 @@ def main() -> int:
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
+        # Only eval_loss is used (early stopping + best model); no compute_metrics. With
+        # the liger fused-CE eval path the model returns logits=None, so the trainer must
+        # not gather eval logits — and skipping them avoids a full seq×vocab eval OOM.
+        prediction_loss_only=has_val,
         # keep the best (lowest eval_loss) model when a val set is present
         load_best_model_at_end=has_val,
         metric_for_best_model="eval_loss" if has_val else None,
