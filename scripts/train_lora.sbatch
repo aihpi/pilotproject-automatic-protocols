@@ -41,6 +41,12 @@ export PATH="$HOME/.local/bin:$PATH"
 # Keep large model downloads off the home quota (shared project storage).
 export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocols/hf-cache}"
 
+# Liger kernels use Triton, which JIT-compiles a small CUDA helper that #includes
+# Python.h. The cluster's system python3.12 has no dev headers, so expose the
+# uv-managed standalone CPython 3.12 headers to gcc via CPATH.
+PYH="$(find "$HOME/.local/share/uv/python" -name Python.h -path '*python3.12*' 2>/dev/null | head -1)"
+[ -n "$PYH" ] && export CPATH="$(dirname "$PYH"):${CPATH:-}"
+
 val_arg=()
 [ -f "$VAL_JSONL" ] && val_arg=(--val-jsonl "$VAL_JSONL")
 
@@ -56,6 +62,9 @@ seqlen_arg=()
 attn_arg=()
 [ -n "$ATTN" ] && attn_arg=(--attn "$ATTN")
 
+liger_arg=()
+[ "${USE_LIGER:-0}" = "1" ] && liger_arg=(--use-liger)
+
 uv run python scripts/train_lora.py \
     --train-jsonl  "$TRAIN_JSONL" \
     "${val_arg[@]}" \
@@ -64,6 +73,7 @@ uv run python scripts/train_lora.py \
     --bits         "$BITS" \
     "${seqlen_arg[@]}" \
     "${attn_arg[@]}" \
+    "${liger_arg[@]}" \
     --epochs       "$EPOCHS" \
     --max-steps    "$MAX_STEPS" \
     "${pack_arg[@]}"

@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
                    help="Disable gradient checkpointing (uses more VRAM)")
     p.add_argument("--packing", action="store_true",
                    help="Pack multiple short examples per sequence (good for per-TOP data)")
+    p.add_argument("--use-liger", action="store_true",
+                   help="Enable Liger fused linear cross-entropy: computes the loss without "
+                        "materialising the full seq×vocab logits tensor, so long --max-seq-len "
+                        "fits on large-vocab models (gemma-4, vocab ~262k). Requires liger-kernel "
+                        "and a supported model_type (gemma4_text is supported).")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
     p.add_argument("--early-stopping-patience", type=int, default=2,
@@ -105,6 +110,26 @@ def build_model_and_tokenizer(args: argparse.Namespace):
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
+
+    if args.use_liger:
+        # Patch the model CLASS *before* loading so the instance uses Liger's
+        # lce_forward: it fuses the lm_head matmul with cross-entropy in chunks and
+        # never materialises the full seq×vocab logits tensor (the OOM at long
+        # --max-seq-len on large-vocab models like gemma-4). The transformers
+        # `use_liger_kernel` flag only swaps the cheap kernels on the *instance* and
+        # leaves the standard full-logits loss path, so we apply it ourselves here.
+        from transformers import AutoConfig
+        from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
+        cfg = AutoConfig.from_pretrained(args.base_model)
+        mt = getattr(getattr(cfg, "text_config", None), "model_type", None) or cfg.model_type
+        apply_fn = MODEL_TYPE_TO_APPLY_LIGER_FN.get(mt)
+        if apply_fn is None:
+            print(f"liger: no kernel for model_type={mt}; using standard loss "
+                  "(long sequences may OOM)", file=sys.stderr)
+        else:
+            apply_fn(fused_linear_cross_entropy=True, cross_entropy=False)
+            print(f"liger: fused-linear-CE patch applied for model_type={mt} "
+                  "(lm_head+CE fused; full logits not materialised)", file=sys.stderr)
 
     print(f"loading {args.base_model} (bits={args.bits}, attn={args.attn})",
           file=sys.stderr, flush=True)
