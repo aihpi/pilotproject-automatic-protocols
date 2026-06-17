@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_lora
 #SBATCH --account=aisc                      # AISC account for resource access
+#SBATCH --qos=aisc                          # AISC QOS — faster queueing on aisc-batch
 #SBATCH --partition=aisc-batch
 # 16-bit LoRA on gemma-4-31B-it (~70 GB weights) plus long, un-truncated
 # sequences (max-seq-len = context window) exceeds one H100; request several so
@@ -45,6 +46,10 @@ export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocol
 # unallocated" on GPU 0; expandable_segments lets the allocator reuse it instead of
 # failing a large contiguous alloc. Cheap, no downside; the runtime suggests it.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Stream Python stdout (the trainer's per-step {'loss':…} dicts) line-by-line instead of
+# block-buffering it, so progress is visible in the .out log while the job runs.
+export PYTHONUNBUFFERED=1
 
 # Liger kernels use Triton, which JIT-compiles a small CUDA helper that #includes
 # Python.h. The cluster's system python3.12 has no dev headers, so expose the

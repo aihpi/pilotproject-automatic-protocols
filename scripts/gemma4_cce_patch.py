@@ -89,13 +89,20 @@ def gemma4_conditional_cce_forward(
 
     if skip_logits:
         # CCE reads the raw lm_head weight (no device hook); align under device_map=auto.
-        e = kept_hidden_states.to(self.lm_head.weight.device)
+        # CCE's backward asserts bf16/fp16 embeddings. In QLoRA, prepare_model_for_kbit_
+        # training upcasts the final norm output (hidden states) to fp32, so cast e — and
+        # the lm_head weight if it was upcast too — to bf16. This matches the all-bf16 path
+        # that trains stably; the loss is still accumulated in fp32 inside the CCE kernel.
+        w = self.lm_head.weight
+        e = kept_hidden_states.to(device=w.device, dtype=torch.bfloat16)
+        if w.dtype not in (torch.bfloat16, torch.float16):
+            w = w.to(torch.bfloat16)
         # shift=True: token i predicts i+1; ignore_index=-100 skips the masked prompt;
         # softcap matches Gemma's final_logit_softcapping. No full logits are built.
         loss = linear_cross_entropy(
             e,
-            self.lm_head.weight,
-            labels.to(self.lm_head.weight.device),
+            w,
+            labels.to(e.device),
             ignore_index=-100,
             softcap=final_logit_softcapping,
             reduction="mean",
