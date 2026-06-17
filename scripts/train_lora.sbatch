@@ -70,6 +70,14 @@ attn_arg=()
 liger_arg=()
 [ "${USE_LIGER:-0}" = "1" ] && liger_arg=(--use-liger)
 
+# Cut-cross-entropy loss (numerically-stable alternative to liger for long-seq gemma-4).
+cce_arg=()
+[ "${USE_CCE:-0}" = "1" ] && cce_arg=(--cce)
+
+# Optional learning-rate override (else train_lora.py default 2e-4).
+lr_arg=()
+[ -n "${LR:-}" ] && lr_arg=(--lr "$LR")
+
 uv run python scripts/train_lora.py \
     --train-jsonl  "$TRAIN_JSONL" \
     "${val_arg[@]}" \
@@ -79,6 +87,8 @@ uv run python scripts/train_lora.py \
     "${seqlen_arg[@]}" \
     "${attn_arg[@]}" \
     "${liger_arg[@]}" \
+    "${cce_arg[@]}" \
+    "${lr_arg[@]}" \
     --epochs       "$EPOCHS" \
     --max-steps    "$MAX_STEPS" \
     "${pack_arg[@]}"

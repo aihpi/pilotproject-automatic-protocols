@@ -85,7 +85,13 @@ def parse_args() -> argparse.Namespace:
                    help="Enable Liger fused linear cross-entropy: computes the loss without "
                         "materialising the full seq×vocab logits tensor, so long --max-seq-len "
                         "fits on large-vocab models (gemma-4, vocab ~262k). Requires liger-kernel "
-                        "and a supported model_type (gemma4_text is supported).")
+                        "and a supported model_type (gemma4_text is supported). NOTE: liger's "
+                        "fused CE produces NaN grads on gemma-4 at long seq / bf16; prefer --cce.")
+    p.add_argument("--cce", action="store_true",
+                   help="Use cut-cross-entropy for the loss instead of liger (mutually exclusive "
+                        "with --use-liger). Same memory benefit (no full logits) but numerically "
+                        "stable at long seq / bf16; supports Gemma's logit softcap. Requires "
+                        "cut-cross-entropy. The numerically-robust choice for gemma-4 long-context.")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
     p.add_argument("--early-stopping-patience", type=int, default=2,
@@ -111,7 +117,13 @@ def build_model_and_tokenizer(args: argparse.Namespace):
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
-    if args.use_liger:
+    if args.cce:
+        # Cut-cross-entropy: patch the wrapper forward to compute the loss without
+        # materialising full logits (numerically stable alternative to liger). No cheap
+        # kernels are installed — only the loss path changes. See gemma4_cce_patch.py.
+        from gemma4_cce_patch import patch_gemma4_conditional_generation_cce
+        patch_gemma4_conditional_generation_cce()
+    elif args.use_liger:
         # Patch the model CLASS *before* loading so the instance uses Liger's
         # fused-linear-CE forward: it fuses the lm_head matmul with cross-entropy in
         # chunks and never materialises the full seq×vocab logits tensor (the OOM at
@@ -298,12 +310,13 @@ def main() -> int:
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         bf16=True,
-        # Tell TRL the model uses a liger fused-CE forward (logits may be None): it then
-        # skips its logits-based metric path in compute_loss and reads token_accuracy
-        # from the output instead. The actual fused forward is installed in
-        # build_model_and_tokenizer; transformers' own liger application is a no-op for
-        # the gemma4 multimodal type, so this flag only flips TRL's loss path.
-        use_liger_kernel=args.use_liger,
+        # Tell TRL the model uses a fused-CE forward that may return logits=None (true for
+        # both --use-liger and --cce): TRL then skips its logits-based metric path in
+        # compute_loss (which would crash on None logits) and reads token_accuracy from the
+        # output instead. The actual fused forward is installed in build_model_and_tokenizer;
+        # transformers' own liger application is a no-op for the gemma4 multimodal type, so
+        # this flag only flips TRL's loss path (CCE returns no token_accuracy -> TRL warns).
+        use_liger_kernel=args.use_liger or args.cce,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",

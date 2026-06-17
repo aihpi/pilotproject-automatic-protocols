@@ -35,6 +35,7 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "tensorboard>=2.20.0",
     "liger-kernel>=0.8.0",
+    "cut-cross-entropy>=25.1.1",
 ]
 
 [tool.uv]
