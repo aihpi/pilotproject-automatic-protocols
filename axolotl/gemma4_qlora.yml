@@ -1,0 +1,75 @@
+# Axolotl QLoRA config — approach #4 of fix/LoRA_alternative_implementations.
+#
+# Highest-level wrapper: one YAML drives QLoRA + FSDP, the least new Python.
+# Minimal = FSDP-sharded QLoRA at a modest cap. Escalation for the *_uncapped
+# 162k-token records: enable sequence/context parallelism (see the block at the
+# bottom). Run via: uv run --extra axolotl accelerate launch -m axolotl.cli.train
+#   axolotl/gemma4_qlora.yml   (see scripts/train_lora_axolotl.sbatch)
+
+base_model: google/gemma-4-31B-it
+# Smoke: override on CLI -> base_model=google/gemma-4-E2B-it sequence_len=4096 max_steps=20
+
+load_in_4bit: true
+adapter: qlora
+bf16: true
+
+# Reuse the pinned comparison dataset (chat 'messages' schema, same as the others).
+datasets:
+  - path: data/train_no_docs/train.jsonl
+    type: chat_template
+    field_messages: messages
+    message_property_mappings:
+      role: role
+      content: content
+    roles_to_train: ["assistant"]      # mask system+transcript prompt, loss on protocol only
+test_datasets:
+  - path: data/train_no_docs/val.jsonl
+    type: chat_template
+    field_messages: messages
+    split: train
+
+sequence_len: 16384                    # start reduced; push to 32768 once stable
+sample_packing: false
+pad_to_sequence_len: true
+
+# LoRA — match the other implementations for comparability.
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+gradient_checkpointing: true
+gradient_accumulation_steps: 16
+micro_batch_size: 1
+num_epochs: 3
+optimizer: adamw_8bit
+lr_scheduler: cosine
+learning_rate: 0.0002
+warmup_ratio: 0.03
+weight_decay: 0.0
+seed: 42
+
+output_dir: results/axolotl_lora
+logging_steps: 1
+saves_per_epoch: 1
+flash_attention: true
+
+# Shard across GPUs (frees GPU 0). Override --num_processes to match --gres.
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_version: 2
+  fsdp_transformer_layer_cls_to_wrap: Gemma4DecoderLayer
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_use_orig_params: true
+
+# --- Escalation for the 162k-token uncapped records (uncomment) -------------
+# context_parallel_size: 4   # split the sequence dim across GPUs (ring attention)

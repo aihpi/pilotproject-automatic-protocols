@@ -1,0 +1,16 @@
+{
+  "comment": "DeepSpeed ZeRO-3 alternative to FSDP for scripts/train_lora_fsdp.py. Usage: accelerate launch --use_deepspeed --deepspeed_config_file configs/zero3.json scripts/train_lora_fsdp.py ... (or reference from an accelerate deepspeed config). bf16 + offload knobs let GPU 0 breathe.",
+  "bf16": { "enabled": true },
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": { "device": "none" },
+    "offload_param": { "device": "none" },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto"
+}

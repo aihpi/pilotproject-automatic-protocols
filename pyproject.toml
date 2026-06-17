@@ -37,6 +37,27 @@ dependencies = [
     "liger-kernel>=0.8.0",
 ]
 
+# Alternative LoRA training stacks (branch fix/LoRA_alternative_implementations).
+# Each is an isolated extra: install only the one a given sbatch needs
+# (uv run --extra <name>). They pull heavier / pinned deps; if a resolver clash
+# with the base torch stack appears, build that extra in a dedicated venv instead.
+[project.optional-dependencies]
+unsloth = [
+    "unsloth>=2025.1.1",
+    "unsloth-zoo>=2025.1.1",
+]
+keras = [
+    "keras>=3.5.0",
+    "keras-hub>=0.18.0",
+    "jax[cuda12]>=0.4.34",
+]
+fsdp = [
+    "deepspeed>=0.15.0",   # ZeRO-3 backend; FSDP itself needs only accelerate (base dep)
+]
+axolotl = [
+    "axolotl>=0.6.0",
+]
+
 [tool.uv]
 # Drop the non-headless opencv-python on Linux (no libGL on the cluster); cv2 is
 # then provided by opencv-python-headless above. Keep it available on macOS.
