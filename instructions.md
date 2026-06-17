@@ -168,20 +168,24 @@ TRAIN_JSONL=data/train/train.jsonl sbatch scripts/train_lora.sbatch
 |---------------|--------------------------------------|
 | `TRAIN_JSONL` | (required)                           |
 | `VAL_JSONL`   | `data/train/val.jsonl` (if present)  |
-| `OUT_DIR`     | `results/lora_adapter`               |
+| `OUT_DIR`     | auto `results/YYYYMMDD-HHMMSS` (4-bit smoke → `results/smoke_lora`) |
 | `BASE_MODEL`  | `google/gemma-4-E2B-it`              |
-| `MAX_SEQ_LEN` | `4096`                               |
-| `BITS`        | `4` (QLoRA)                          |
+| `MAX_SEQ_LEN` | auto = model context window (empty)  |
+| `BITS`        | `16` (bf16 LoRA; `4` = QLoRA smoke)  |
 | `EPOCHS`      | `3`                                  |
 | `MAX_STEPS`   | `-1` (use epochs; set small to smoke-test) |
+| `USE_CCE`     | `0` (set `1` for long-context — see below) |
+| `LR`          | (empty = `2e-4`)                     |
+
+The sbatch also sets `#SBATCH --qos=aisc` (faster AISC queueing), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (allocator fragmentation), and `PYTHONUNBUFFERED=1` (stream the per-step loss to the `.out` log). Each run writes a `train_log.md` **and** a `README.md` of its settings into the timestamped output dir.
 
 Scale up to the 31B with `BASE_MODEL=google/gemma-4-31B-it`. `HF_HOME` defaults to shared project storage to keep downloads off the home quota.
 
-Key `train_lora.py` flags: `--bits {4,16}`, `--lora-r/--lora-alpha/--lora-dropout`, `--target-modules`/`--exclude-modules`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--packing`, `--attn {sdpa,flash_attention_2,eager}`.
+Key `train_lora.py` flags: `--bits {4,16}`, `--cce`, `--lora-r/--lora-alpha/--lora-dropout`, `--target-modules`/`--exclude-modules`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--packing`, `--attn {sdpa,flash_attention_2,eager}`.
 
 > **Watch the sequence length:** per-TOP records with timestamps can exceed `MAX_SEQ_LEN=4096` real tokens and get truncated (losing part of the target). Raise `--max-seq-len` (e.g. 8192) for long sessions.
 >
-> **Long sequences on the 31B — use `USE_LIGER=1`:** gemma-4-31B-it has a ~256k-token vocabulary, so the *stock* loss step materialises a `seq_len × vocab` logits tensor (plus an fp32 cross-entropy copy) on one device — this OOMs a single 80 GB H100 well before the context window (historically ~32k borderline, `>40k` OOM). `--use-liger` (env `USE_LIGER=1`) fixes this: it patches Gemma-4's forward with a **fused-linear cross-entropy** that never materialises the full logits tensor, so long and even **uncapped** training works (verified at 32768; loss is identical to the stock path). For bf16 the fused kernel accumulates in fp32 to stay numerically stable. Without `--use-liger` you must still cap (`build_dataset.py --max-seq-len N` length-excludes over-long records rather than truncating, keeping the two sides aligned). The remaining memory cost at very long lengths is attention+activations, not logits — `--attn flash_attention_2` and/or more GPUs (`device_map=auto` shards across them) bound that.
+> **Long sequences on the 31B — use `USE_CCE=1`:** gemma-4-31B-it has a ~262k-token vocabulary, so the *stock* loss step materialises a `seq_len × vocab` logits tensor (plus an fp32 cross-entropy copy) on one device — this OOMs an 80 GB H100 well before the context window (historically ~32k borderline, `>40k` OOM). `--cce` (env `USE_CCE=1`) fixes it: it computes the loss with **cut-cross-entropy**, which never materialises the full logits tensor, so long and even **uncapped** training works. Numerically stable at long seq and in bf16, and it honours Gemma's logit softcap (verified at bf16@4096 and 4-bit@32768). The remaining memory cost at very long lengths is attention+activations, not logits — `--attn flash_attention_2` and/or more GPUs (`device_map=auto` shards across them) bound that. (An earlier liger fused-CE attempt diverged with NaN gradients at long seq/bf16 and was removed.)
 
 
 ## E. Inference (GPU / SLURM)

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Cut-Cross-Entropy (CCE) forward for ``Gemma4ForConditionalGeneration``.
 
-Same goal as ``gemma4_liger_patch`` — compute the LM loss without materialising the
-full ``seq×vocab(262144)`` logits tensor, so long-context training fits — but using
-Apple's **cut-cross-entropy** kernel instead of liger's fused-linear CE. CCE is the
-fallback because liger's fused CE produces NaN gradients on this model at long
-sequence length / bf16 (see memory `oom-fix-and-bf16-gotcha`); CCE is designed for
-numerical stability and supports Gemma's logit softcap natively.
+Computes the LM loss with Apple's **cut-cross-entropy** kernel, without ever
+materialising the full ``seq×vocab(262144)`` logits tensor — so long-context training
+fits on large-vocab models (gemma-4). CCE is numerically stable and supports Gemma's
+logit softcap natively (an earlier liger fused-CE attempt produced NaN gradients on
+this model at long seq / bf16 — see memory `oom-fix-and-bf16-gotcha`).
 
 `cut_cross_entropy.linear_cross_entropy(e, c, targets, softcap=…, shift=True, …)`
 takes the hidden states `e` ([B,T,H]) and the lm_head weight `c` ([vocab,H]) directly
@@ -14,9 +13,9 @@ and returns the scalar loss without ever building the logits. `shift=True` appli
 causal offset (token i predicts i+1); `ignore_index=-100` skips the masked prompt.
 
 Apply with :func:`patch_gemma4_conditional_generation_cce` *before* ``from_pretrained``.
-Like the liger patch: gate the fused path on *labels present* (so eval is also memory
--safe) and move hidden states to the (tied) lm_head weight's device under
-``device_map="auto"`` (CCE reads the raw weight; no accelerate hook fires).
+Gate the fused path on *labels present* (so eval is also memory-safe) and move hidden
+states to the (tied) lm_head weight's device under ``device_map="auto"`` (CCE reads the
+raw weight; no accelerate hook fires).
 """
 from __future__ import annotations
 
@@ -51,7 +50,7 @@ def gemma4_conditional_cce_forward(
     """Drop-in ``Gemma4ForConditionalGeneration.forward`` using CCE for the loss."""
     from transformers.models.gemma4.modeling_gemma4 import Gemma4CausalLMOutputWithPast
 
-    # See gemma4_liger_patch: replacing .forward loses @can_return_tuple, which strips
+    # Replacing .forward loses the stock @can_return_tuple decorator, which strips
     # return_dict; drop it to avoid colliding with the explicit return_dict=True below.
     kwargs.pop("return_dict", None)
 

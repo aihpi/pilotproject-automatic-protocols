@@ -25,7 +25,7 @@ set +a
 
 : "${TRAIN_JSONL:?Set TRAIN_JSONL=path/to/train.jsonl}"
 VAL_JSONL="${VAL_JSONL:-data/train/val.jsonl}"
-OUT_DIR="${OUT_DIR:-}"             # empty = auto-name (results/YYYYMMDD_XX_lora; smoke -> smoke_lora)
+OUT_DIR="${OUT_DIR:-}"             # empty = auto-name (results/YYYYMMDD-HHMMSS; 4-bit smoke -> smoke_lora)
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"     # empty = auto (model context window)
 BITS="${BITS:-16}"                 # 16 = real bf16 LoRA; smoke test: BITS=4 MAX_STEPS=5
@@ -51,7 +51,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # block-buffering it, so progress is visible in the .out log while the job runs.
 export PYTHONUNBUFFERED=1
 
-# Liger kernels use Triton, which JIT-compiles a small CUDA helper that #includes
+# Cut-cross-entropy uses Triton, which JIT-compiles a small CUDA helper that #includes
 # Python.h. The cluster's system python3.12 has no dev headers, so expose the
 # uv-managed standalone CPython 3.12 headers to gcc via CPATH.
 PYH="$(find "$HOME/.local/share/uv/python" -name Python.h -path '*python3.12*' 2>/dev/null | head -1)"
@@ -72,10 +72,7 @@ seqlen_arg=()
 attn_arg=()
 [ -n "$ATTN" ] && attn_arg=(--attn "$ATTN")
 
-liger_arg=()
-[ "${USE_LIGER:-0}" = "1" ] && liger_arg=(--use-liger)
-
-# Cut-cross-entropy loss (numerically-stable alternative to liger for long-seq gemma-4).
+# Cut-cross-entropy loss: avoids the seq×vocab logits OOM for long-seq gemma-4 training.
 cce_arg=()
 [ "${USE_CCE:-0}" = "1" ] && cce_arg=(--cce)
 
@@ -91,7 +88,6 @@ uv run python scripts/train_lora.py \
     --bits         "$BITS" \
     "${seqlen_arg[@]}" \
     "${attn_arg[@]}" \
-    "${liger_arg[@]}" \
     "${cce_arg[@]}" \
     "${lr_arg[@]}" \
     --epochs       "$EPOCHS" \

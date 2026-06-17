@@ -38,9 +38,9 @@ def parse_args() -> argparse.Namespace:
                    help="HF model id or local path (default: google/gemma-4-E2B-it for "
                         "testing; scale up with e.g. google/gemma-4-31B-it)")
     p.add_argument("--out-dir", type=Path, default=None,
-                   help="Adapter output dir. Default: auto-named results/YYYYMMDD_XX_lora for "
-                        "16-bit runs (+ a YYYYMMDD_XX_log.md), results/smoke_lora for 4-bit "
-                        "smoke runs. Pass a path to override.")
+                   help="Adapter output dir. Default: auto-named results/YYYYMMDD-HHMMSS for "
+                        "real runs (with train_log.md + README.md inside), results/smoke_lora "
+                        "for 4-bit smoke runs. Pass a path to override.")
     p.add_argument("--bits", type=int, choices=(4, 16), default=16,
                    help="16 = bf16 LoRA (default, real runs), 4 = QLoRA NF4 (smoke test)")
     p.add_argument("--max-seq-len", type=int, default=None,
@@ -81,17 +81,12 @@ def parse_args() -> argparse.Namespace:
                    help="Disable gradient checkpointing (uses more VRAM)")
     p.add_argument("--packing", action="store_true",
                    help="Pack multiple short examples per sequence (good for per-TOP data)")
-    p.add_argument("--use-liger", action="store_true",
-                   help="Enable Liger fused linear cross-entropy: computes the loss without "
-                        "materialising the full seq×vocab logits tensor, so long --max-seq-len "
-                        "fits on large-vocab models (gemma-4, vocab ~262k). Requires liger-kernel "
-                        "and a supported model_type (gemma4_text is supported). NOTE: liger's "
-                        "fused CE produces NaN grads on gemma-4 at long seq / bf16; prefer --cce.")
     p.add_argument("--cce", action="store_true",
-                   help="Use cut-cross-entropy for the loss instead of liger (mutually exclusive "
-                        "with --use-liger). Same memory benefit (no full logits) but numerically "
-                        "stable at long seq / bf16; supports Gemma's logit softcap. Requires "
-                        "cut-cross-entropy. The numerically-robust choice for gemma-4 long-context.")
+                   help="Use cut-cross-entropy for the loss: computes it without materialising the "
+                        "full seq×vocab logits tensor, so long --max-seq-len fits on large-vocab "
+                        "models (gemma-4, vocab ~262k). Numerically stable at long seq / bf16 and "
+                        "supports Gemma's logit softcap. Required for long-context gemma-4 training; "
+                        "needs the cut-cross-entropy package. See scripts/gemma4_cce_patch.py.")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
     p.add_argument("--early-stopping-patience", type=int, default=2,
@@ -118,40 +113,11 @@ def build_model_and_tokenizer(args: argparse.Namespace):
         )
 
     if args.cce:
-        # Cut-cross-entropy: patch the wrapper forward to compute the loss without
-        # materialising full logits (numerically stable alternative to liger). No cheap
-        # kernels are installed — only the loss path changes. See gemma4_cce_patch.py.
+        # Cut-cross-entropy: patch the gemma-4 multimodal wrapper's forward to compute the
+        # loss without materialising the full seq×vocab logits tensor (the long-seq OOM on
+        # large-vocab models). Patch the CLASS *before* loading. See gemma4_cce_patch.py.
         from gemma4_cce_patch import patch_gemma4_conditional_generation_cce
         patch_gemma4_conditional_generation_cce()
-    elif args.use_liger:
-        # Patch the model CLASS *before* loading so the instance uses Liger's
-        # fused-linear-CE forward: it fuses the lm_head matmul with cross-entropy in
-        # chunks and never materialises the full seq×vocab logits tensor (the OOM at
-        # long --max-seq-len on large-vocab models like gemma-4). The transformers
-        # `use_liger_kernel` flag only swaps the cheap kernels on the *instance* and
-        # leaves the standard full-logits loss path, so we apply it ourselves here.
-        from transformers import AutoConfig
-        from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
-        cfg = AutoConfig.from_pretrained(args.base_model)
-        text_cfg = getattr(cfg, "text_config", None)
-        mt = getattr(text_cfg, "model_type", None) or cfg.model_type
-        apply_fn = MODEL_TYPE_TO_APPLY_LIGER_FN.get(mt)
-        if apply_fn is None:
-            print(f"liger: no kernel for model_type={mt}; using standard loss "
-                  "(long sequences may OOM)", file=sys.stderr)
-        else:
-            # Installs liger's cheap kernels (RMSNorm/GEGLU/rope) on the text modules
-            # AND its fused-CE forward on the *text* class (e.g. Gemma4ForCausalLM).
-            apply_fn(fused_linear_cross_entropy=True, cross_entropy=False)
-            print(f"liger: fused-linear-CE patch applied for model_type={mt} "
-                  "(lm_head+CE fused; full logits not materialised)", file=sys.stderr)
-        # gemma-4 loads as the multimodal wrapper Gemma4ForConditionalGeneration, which
-        # liger does NOT patch (it only patches the text-only Gemma4ForCausalLM) — its
-        # stock forward still materialises full logits. Patch the wrapper too so the
-        # fused path actually engages. See scripts/gemma4_liger_patch.py.
-        if cfg.model_type == "gemma4" and text_cfg is not None:
-            from gemma4_liger_patch import patch_gemma4_conditional_generation
-            patch_gemma4_conditional_generation()
 
     print(f"loading {args.base_model} (bits={args.bits}, attn={args.attn})",
           file=sys.stderr, flush=True)
@@ -218,6 +184,7 @@ def write_train_log(log_path: Path, args: argparse.Namespace, *, out_dir: Path,
         ("SLURM job", os.environ.get("SLURM_JOB_ID", "-")),
         ("base model", args.base_model),
         ("bits", f"{args.bits} ({'QLoRA NF4' if args.bits == 4 else 'bf16 LoRA'})"),
+        ("loss", "cut-cross-entropy" if args.cce else "standard cross-entropy"),
         ("adapter dir", str(out_dir)),
         ("tensorboard", logging_dir),
         ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
@@ -249,6 +216,41 @@ def write_train_log(log_path: Path, args: argparse.Namespace, *, out_dir: Path,
     print(f"wrote run log to {log_path}", file=sys.stderr)
 
 
+def write_run_readme(out_dir: Path, args: argparse.Namespace, *, n_train: int, n_val: int,
+                     train_loss: float, best_metric) -> None:
+    """Write a human-readable ``README.md`` of the run's key settings into the adapter dir
+    (overwrites PEFT's generic model-card README). Companion to the full ``train_log.md``."""
+    bits = f"{args.bits}-bit ({'QLoRA NF4' if args.bits == 4 else 'bf16 LoRA'})"
+    loss = "cut-cross-entropy (--cce)" if args.cce else "standard cross-entropy"
+    eff = args.batch_size * args.grad_accum
+    best = f"{best_metric:.4f}" if best_metric is not None else "-"
+    lines = [
+        f"# LoRA adapter — {out_dir.name}",
+        "",
+        f"Fine-tuned `{args.base_model}` with {bits} + {loss}.",
+        "",
+        "| setting | value |",
+        "|---|---|",
+        f"| base model | `{args.base_model}` |",
+        f"| dataset (train / val) | `{args.train_jsonl}` ({n_train} / {n_val}) |",
+        f"| precision | {bits} |",
+        f"| loss | {loss} |",
+        f"| max seq len | {args.max_seq_len} |",
+        f"| LoRA r / alpha / dropout | {args.lora_r} / {args.lora_alpha} / {args.lora_dropout} |",
+        f"| epochs / effective batch | {args.epochs} / {eff} |",
+        f"| learning rate | {args.lr} |",
+        f"| final train loss | {train_loss:.4f} |",
+        f"| best eval_loss | {best} |",
+        f"| date | {datetime.now().isoformat(timespec='seconds')} |",
+        f"| SLURM job | {os.environ.get('SLURM_JOB_ID', '-')} |",
+        "",
+        "See `train_log.md` for the full parameter list.",
+        "",
+    ]
+    (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    print(f"wrote README to {out_dir / 'README.md'}", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -275,6 +277,20 @@ def main() -> int:
     from datasets import load_dataset
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
+
+    class _LossOnlySFTTrainer(SFTTrainer):
+        """SFTTrainer whose compute_loss returns the model's loss without touching
+        ``outputs.logits``. The CCE forward returns ``logits=None`` (the whole point — the
+        full seq×vocab logits are never built), which TRL's default compute_loss would crash
+        on while computing its token-accuracy/entropy metric. Bypassing that metric is fine:
+        CCE doesn't expose per-token logits anyway. This also frees us from setting
+        ``use_liger_kernel=True`` (which would force a liger-kernel import) just to make TRL
+        tolerate the missing logits."""
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            inputs.pop("_prediction_loss_only", None)
+            outputs = model(**inputs)
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
 
     data_files = {"train": str(args.train_jsonl)}
     if args.val_jsonl and args.val_jsonl.exists():
@@ -310,13 +326,6 @@ def main() -> int:
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         bf16=True,
-        # Tell TRL the model uses a fused-CE forward that may return logits=None (true for
-        # both --use-liger and --cce): TRL then skips its logits-based metric path in
-        # compute_loss (which would crash on None logits) and reads token_accuracy from the
-        # output instead. The actual fused forward is installed in build_model_and_tokenizer;
-        # transformers' own liger application is a no-op for the gemma4 multimodal type, so
-        # this flag only flips TRL's loss path (CCE returns no token_accuracy -> TRL warns).
-        use_liger_kernel=args.use_liger or args.cce,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",
@@ -325,9 +334,9 @@ def main() -> int:
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
-        # Only eval_loss is used (early stopping + best model); no compute_metrics. With
-        # the liger fused-CE eval path the model returns logits=None, so the trainer must
-        # not gather eval logits — and skipping them avoids a full seq×vocab eval OOM.
+        # Only eval_loss is used (early stopping + best model); no compute_metrics. With the
+        # CCE fused-loss path the model returns logits=None, so the trainer must not gather
+        # eval logits — and skipping them avoids a full seq×vocab eval OOM.
         prediction_loss_only=has_val,
         # keep the best (lowest eval_loss) model when a val set is present
         load_best_model_at_end=has_val,
@@ -339,7 +348,9 @@ def main() -> int:
         dataset_num_proc=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
 
-    trainer = SFTTrainer(
+    # CCE returns logits=None, so use the loss-only trainer that skips TRL's logits metric.
+    trainer_cls = _LossOnlySFTTrainer if args.cce else SFTTrainer
+    trainer = trainer_cls(
         model=model,
         args=sft_config,
         train_dataset=dataset["train"],
@@ -360,14 +371,17 @@ def main() -> int:
     tokenizer.save_pretrained(str(out_dir))
     print(f"saved adapter to {out_dir}", file=sys.stderr)
 
+    n_val = len(dataset["validation"]) if has_val else 0
     if log_path is not None:
         write_train_log(
             log_path, args, out_dir=out_dir, logging_dir=logging_dir,
-            n_train=len(dataset["train"]),
-            n_val=len(dataset["validation"]) if has_val else 0,
+            n_train=len(dataset["train"]), n_val=n_val,
             train_loss=result.training_loss,
             best_metric=trainer.state.best_metric,
             best_ckpt=trainer.state.best_model_checkpoint)
+    # Human-readable run summary (replaces PEFT's generic model-card README.md).
+    write_run_readme(out_dir, args, n_train=len(dataset["train"]), n_val=n_val,
+                     train_loss=result.training_loss, best_metric=trainer.state.best_metric)
     return 0
 
 
