@@ -96,17 +96,25 @@ def gemma4_conditional_cce_forward(
         e = kept_hidden_states.to(device=w.device, dtype=torch.bfloat16)
         if w.dtype not in (torch.bfloat16, torch.float16):
             w = w.to(torch.bfloat16)
-        # shift=True: token i predicts i+1; ignore_index=-100 skips the masked prompt;
-        # softcap matches Gemma's final_logit_softcapping. No full logits are built.
-        loss = linear_cross_entropy(
-            e,
-            w,
-            labels.to(e.device),
-            ignore_index=-100,
-            softcap=final_logit_softcapping,
-            reduction="mean",
-            shift=True,
-        )
+        # Guard: with assistant_only_loss a micro-batch can have zero non-masked
+        # target tokens (a short/edge record after the causal shift). CCE's backward
+        # divides by the valid-token count (`grad_scale = 1 / lse.numel()`) and would
+        # crash with ZeroDivisionError; return a differentiable zero loss instead so
+        # that batch contributes no gradient and training continues.
+        if labels is not None and int((labels[..., 1:] != -100).sum()) == 0:
+            loss = e.float().sum() * 0.0
+        else:
+            # shift=True: token i predicts i+1; ignore_index=-100 skips the masked
+            # prompt; softcap matches Gemma's final_logit_softcapping. No full logits.
+            loss = linear_cross_entropy(
+                e,
+                w,
+                labels.to(e.device),
+                ignore_index=-100,
+                softcap=final_logit_softcapping,
+                reduction="mean",
+                shift=True,
+            )
     else:
         # Generation / explicit skip_logits=False: stock full-logits path.
         logits = self.lm_head(kept_hidden_states)

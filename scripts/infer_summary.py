@@ -95,9 +95,16 @@ def generate(model, tokenizer, system: str, user: str, args: argparse.Namespace)
             input_ids,
             attention_mask=attn,
             max_new_tokens=args.max_new_tokens,
+            min_new_tokens=args.min_new_tokens,
             do_sample=args.temperature > 0,
             temperature=args.temperature if args.temperature > 0 else None,
             top_p=args.top_p,
+            # Anti-degeneration controls (default off → unchanged behaviour). The
+            # repetition/echo loops seen on long per-TOP inputs are curbed by
+            # repetition_penalty>1 and no_repeat_ngram_size>0. See
+            # tmp/HANDOFF_repetition_fix.md.
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             streamer=streamer,
@@ -156,12 +163,20 @@ def main() -> int:
                    help="Summarise per agenda item or whole document (default: per-top)")
     p.add_argument("--max-new-tokens", type=int, default=4096,
                    help="Max generated tokens per call (default: 4096)")
-    p.add_argument("--max-seq-len", type=int, default=None,
-                   help="Max prompt length before truncation. Default: the model's context "
-                        "window (auto-detected, e.g. gemma-4-31B-it = 262144).")
+    p.add_argument("--max-seq-len", type=int, default=65536,
+                   help="Max prompt length before truncation. Default: 65536 (65k, matching "
+                        "the training cap). Pass 0 for the model's full context window "
+                        "(auto-detected, e.g. gemma-4-31B-it = 262144).")
     p.add_argument("--temperature", type=float, default=0.3,
                    help="Sampling temperature; 0 = greedy (default: 0.3)")
     p.add_argument("--top-p", type=float, default=0.9, help="Nucleus top-p (default: 0.9)")
+    p.add_argument("--repetition-penalty", type=float, default=1.0,
+                   help="Penalty on repeated tokens; 1.0 = off. Try ~1.3 to curb echo/"
+                        "repetition loops on long per-TOP inputs (default: 1.0)")
+    p.add_argument("--no-repeat-ngram-size", type=int, default=0,
+                   help="Block repeating n-grams of this size; 0 = off. Try 3 (default: 0)")
+    p.add_argument("--min-new-tokens", type=int, default=0,
+                   help="Minimum generated tokens before EOS allowed (default: 0)")
     p.add_argument("--system-prompt-file", type=Path, default=None,
                    help="Custom system prompt file (default: built-in German prompt)")
     p.add_argument("--stream", action="store_true", help="Stream tokens to stderr while generating")
@@ -174,7 +189,7 @@ def main() -> int:
         print(f"no .md/.txt inputs found at {args.input}", file=sys.stderr)
         return 1
 
-    if args.max_seq_len is None:
+    if not args.max_seq_len:  # None or 0 -> fall back to the model's full context window
         args.max_seq_len = context_window(str(args.merged_model or args.base_model))
     print(f"max-seq-len: {args.max_seq_len} tokens", file=sys.stderr)
 

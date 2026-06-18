@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Unsloth Triton JIT compile cache (build artifact)
+unsloth_compiled_cache/
+
 # Distribution / packaging
 .Python
 build/
