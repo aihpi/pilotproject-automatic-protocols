@@ -1,55 +1,53 @@
 <div style="background-color: #ffffff; color: #000000; padding: 10px;">
 <img src="00_aisc\img\logo_aisc_bmftr.jpg">
-<h1> Your title.
+<h1> Automatic Protocols — committee transcripts → protocols
 </div>
 
-Your Project Description with a nice image
+Fine-tune and run a LoRA adapter on `google/gemma-4` to turn Landtag/committee meeting
+**transcripts** into structured German **protocols** (per agenda item / *Tagesordnungspunkt*).
+The pipeline ingests raw audio/PDF/DOCX, prepares speaker-labelled and TOP-tagged transcripts,
+builds an instruction dataset, trains a (Q)LoRA adapter, and generates protocol summaries.
 
-## Features
+## Pipeline
 
-- **Key Feature 1**: A description of the Key features
-- **Key Feature 2**: A description of the Key features
+| stage | script | what it does |
+|---|---|---|
+| **A. Ingest** | `scripts/ingest_corpus.py`, `pdf_to_markdown.py`, `docx_to_markdown.py`, `transcribe.py` | stage the raw corpus; PDF/DOCX/audio → markdown |
+| **B. Prepare** | `tag_transcript_tops.py`, `match_speakers.py` | tag agenda-item (TOP) boundaries and resolve speaker names → `data/transcripts/md_prepared/` |
+| **C. Dataset** | `scripts/build_dataset.py` | pair transcripts↔protocols per TOP, write chat-format `train/val.jsonl` |
+| **D. Train** | `scripts/train_lora.py` (+ `train_lora.sbatch`) | (Q)LoRA fine-tune on SLURM; long-context via cut-cross-entropy (`--cce`) |
+| **E. Infer** | `scripts/infer_summary.py` (+ `infer_summary.sbatch`) | generate protocol summaries from new transcripts |
 
-## Setup and Installation
+## Long-context training (the OOM fix)
 
-### Prerequisites
+gemma-4-31B has a ~262k-token vocabulary, so the standard loss materialises a
+`seq_len × vocab` logits tensor that OOMs a single 80 GB H100 beyond ~32k tokens. Training
+with **`--cce` (`USE_CCE=1`)** uses **cut-cross-entropy** to compute the loss without ever
+building that tensor — enabling long and even uncapped sequences, numerically stable in bf16,
+honouring Gemma's logit softcap. See `scripts/gemma4_cce_patch.py`.
 
-- Docker and Docker Compose
-- NVIDIA GPU with CUDA support (optional, but recommended for faster performance)
+## Quick start
 
-### Quick Start
+```bash
+# Train (SLURM) — long-context QLoRA on the 31B
+USE_CCE=1 BITS=4 MAX_SEQ_LEN=32768 BASE_MODEL=google/gemma-4-31B-it \
+  TRAIN_JSONL=data/train_no_docs/train.jsonl VAL_JSONL=data/train_no_docs/val.jsonl \
+  sbatch --qos=aisc --gres=gpu:h100:2 --constraint=ARCH:X86 scripts/train_lora.sbatch
 
-1. Clone the repository:
-   ```bash
-   git clone ...
-   cd ...
-   ```
+# Infer with a trained adapter
+INPUT=data/transcripts/md_prepared/example_Transkript.md \
+  ADAPTER=results/<YYYYMMDD-HHMMSS> sbatch scripts/infer_summary.sbatch
+```
 
-2. Run the setup or install dependencies:
-   ```bash
-   chmod +x setup.sh
-   ./setup.sh
-   ```
-
-3. Access the application:
-   - Frontend: ...
-   - Backend API: ...
-
-## User Guide
-
-### Using the Tool
-1. A brief description of using the tool.
-2. Be clear and simple.
-
-### Recommendations
-Any additional hints for using the tool.
-
+Each training run writes a self-contained `results/YYYYMMDD-HHMMSS/` folder (adapter + tokenizer
++ `train_log.md` + `README.md`). **Full pipeline details, flags, and SLURM/cluster notes are in
+[`instructions.md`](instructions.md).**
 
 ## Limitations
 
-- **Limitation 1**: List of Limitations
-- **Limitation 2**: List of Limitations
-
+- Built for German committee/Landtag protocols; the TOP-tagging heuristics are committee-oriented.
+- Very long whole-document records (100k+ tokens) stress attention/activation memory even with
+  cut-cross-entropy; cap or shard as needed.
 
 ## gemma-4-31B LoRA — alternative training stacks (status & open problems)
 
@@ -96,14 +94,7 @@ and run instructions: [`LORA_ALTERNATIVES.md`](LORA_ALTERNATIVES.md).
 
 ## References
 
-- [Reference 1](https://hpi.de/kisz)
-- [Reference 2](https://hpi.de/kisz)
-
-## Author
-- [Your Name](https://hpi.de/kisz)
-
-## License
-
+- [AI Service Centre Berlin-Brandenburg](https://hpi.de/kisz)
 
 ---
 

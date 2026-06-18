@@ -16,9 +16,6 @@ Apply with :func:`patch_gemma4_conditional_generation_cce` *before* ``from_pretr
 Gate the fused path on *labels present* (so eval is also memory-safe) and move hidden
 states to the (tied) lm_head weight's device under ``device_map="auto"`` (CCE reads the
 raw weight; no accelerate hook fires).
-
-Vendored verbatim from the `fix/OOM_issues` branch for reuse by the FSDP track
-(scripts/train_lora_fsdp.py --cce). Do not diverge from the upstream copy.
 """
 from __future__ import annotations
 
