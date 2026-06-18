@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_lora
 #SBATCH --account=aisc                      # AISC account for resource access
+#SBATCH --qos=aisc                          # AISC QOS — faster queueing on aisc-batch
 #SBATCH --partition=aisc-batch
 # 16-bit LoRA on gemma-4-31B-it (~70 GB weights) plus long, un-truncated
 # sequences (max-seq-len = context window) exceeds one H100; request several so
@@ -24,7 +25,7 @@ set +a
 
 : "${TRAIN_JSONL:?Set TRAIN_JSONL=path/to/train.jsonl}"
 VAL_JSONL="${VAL_JSONL:-data/train/val.jsonl}"
-OUT_DIR="${OUT_DIR:-}"             # empty = auto-name (results/YYYYMMDD_XX_lora; smoke -> smoke_lora)
+OUT_DIR="${OUT_DIR:-}"             # empty = auto-name (results/YYYYMMDD-HHMMSS; 4-bit smoke -> smoke_lora)
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"     # empty = auto (model context window)
 BITS="${BITS:-16}"                 # 16 = real bf16 LoRA; smoke test: BITS=4 MAX_STEPS=5
@@ -41,7 +42,16 @@ export PATH="$HOME/.local/bin:$PATH"
 # Keep large model downloads off the home quota (shared project storage).
 export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocols/hf-cache}"
 
-# Liger kernels use Triton, which JIT-compiles a small CUDA helper that #includes
+# Reduce CUDA allocator fragmentation. The OOM logs show several GiB "reserved but
+# unallocated" on GPU 0; expandable_segments lets the allocator reuse it instead of
+# failing a large contiguous alloc. Cheap, no downside; the runtime suggests it.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Stream Python stdout (the trainer's per-step {'loss':…} dicts) line-by-line instead of
+# block-buffering it, so progress is visible in the .out log while the job runs.
+export PYTHONUNBUFFERED=1
+
+# Cut-cross-entropy uses Triton, which JIT-compiles a small CUDA helper that #includes
 # Python.h. The cluster's system python3.12 has no dev headers, so expose the
 # uv-managed standalone CPython 3.12 headers to gcc via CPATH.
 PYH="$(find "$HOME/.local/share/uv/python" -name Python.h -path '*python3.12*' 2>/dev/null | head -1)"
@@ -62,8 +72,13 @@ seqlen_arg=()
 attn_arg=()
 [ -n "$ATTN" ] && attn_arg=(--attn "$ATTN")
 
-liger_arg=()
-[ "${USE_LIGER:-0}" = "1" ] && liger_arg=(--use-liger)
+# Cut-cross-entropy loss: avoids the seq×vocab logits OOM for long-seq gemma-4 training.
+cce_arg=()
+[ "${USE_CCE:-0}" = "1" ] && cce_arg=(--cce)
+
+# Optional learning-rate override (else train_lora.py default 2e-4).
+lr_arg=()
+[ -n "${LR:-}" ] && lr_arg=(--lr "$LR")
 
 uv run python scripts/train_lora.py \
     --train-jsonl  "$TRAIN_JSONL" \
@@ -73,7 +88,8 @@ uv run python scripts/train_lora.py \
     --bits         "$BITS" \
     "${seqlen_arg[@]}" \
     "${attn_arg[@]}" \
-    "${liger_arg[@]}" \
+    "${cce_arg[@]}" \
+    "${lr_arg[@]}" \
     --epochs       "$EPOCHS" \
     --max-steps    "$MAX_STEPS" \
     "${pack_arg[@]}"
