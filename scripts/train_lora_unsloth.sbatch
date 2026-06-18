@@ -23,13 +23,13 @@ set -a
 [ -f .env ] && . ./.env
 set +a
 
-# Pinned comparison dataset (cap 32768). Smoke: BASE_MODEL=google/gemma-4-E2B-it
+# Default dataset = 65k cap. Smoke: BASE_MODEL=google/gemma-4-E2B-it
 # MAX_SEQ_LEN=4096 MAX_STEPS=20
-TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs/train.jsonl}"
-VAL_JSONL="${VAL_JSONL:-data/train_no_docs/val.jsonl}"
+TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs_cap65k/train.jsonl}"
+VAL_JSONL="${VAL_JSONL:-data/train_no_docs_cap65k/val.jsonl}"
 OUT_DIR="${OUT_DIR:-}"             # empty = script auto-names results/YYYYMMDD-HHMMSS
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-32768}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 32768)
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
 

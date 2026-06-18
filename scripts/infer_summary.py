@@ -171,10 +171,11 @@ def main() -> int:
                    help="Sampling temperature; 0 = greedy (default: 0.3)")
     p.add_argument("--top-p", type=float, default=0.9, help="Nucleus top-p (default: 0.9)")
     p.add_argument("--repetition-penalty", type=float, default=1.0,
-                   help="Penalty on repeated tokens; 1.0 = off. Try ~1.3 to curb echo/"
-                        "repetition loops on long per-TOP inputs (default: 1.0)")
+                   help="Penalty on repeated tokens; 1.0 = off. Try a GENTLE ~1.15 to curb "
+                        "echo/loops (1.3 over-suppresses into character-salad) (default: 1.0)")
     p.add_argument("--no-repeat-ngram-size", type=int, default=0,
-                   help="Block repeating n-grams of this size; 0 = off. Try 3 (default: 0)")
+                   help="Block repeating n-grams of this size; 0 = off (recommended). Small "
+                        "values (e.g. 3) forbid legitimate German phrases → salad (default: 0)")
     p.add_argument("--min-new-tokens", type=int, default=0,
                    help="Minimum generated tokens before EOS allowed (default: 0)")
     p.add_argument("--system-prompt-file", type=Path, default=None,

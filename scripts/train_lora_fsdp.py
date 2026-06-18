@@ -32,8 +32,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-model", default="google/gemma-4-E2B-it")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="Run folder. Default: auto-named results/YYYYMMDD-HHMMSS")
-    p.add_argument("--max-seq-len", type=int, default=16384,
-                   help="Start reduced (8k-16k): sharding doesn't fix the logits term")
+    p.add_argument("--max-seq-len", type=int, default=65536,
+                   help="65k cap (default). Sharding doesn't fix the seq×vocab logits "
+                        "term, so --cce is required at this length (start 8k-16k to smoke).")
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.05)
@@ -69,7 +70,10 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
-    from alt_utils import resolve_out_dir, write_run_log, write_run_readme, render_chat
+    from alt_utils import resolve_out_dir, write_run_log, write_run_readme
+    # Reuse the PEFT path's validated assistant-only-loss helpers so the FSDP adapter
+    # is trained identically (mask system+user, train on the assistant turn only).
+    from train_lora import enable_assistant_only_loss, drop_overlong_records
 
     args.out_dir = resolve_out_dir(args.out_dir)
 
@@ -99,13 +103,25 @@ def main() -> int:
     if args.val_jsonl and args.val_jsonl.exists():
         data_files["validation"] = str(args.val_jsonl)
     dataset = load_dataset("json", data_files=data_files)
-    # Pre-render chat 'messages' to a plain 'text' column (the Gemma template needs
-    # typed-parts content; doing it here avoids trl's assistant_only_loss path, which
-    # requires {% generation %} markers the Gemma template lacks).
-    dataset = dataset.map(lambda ex: {"text": render_chat(tokenizer, ex["messages"])},
-                          remove_columns=["messages", "meta"])
-    has_val = "validation" in dataset
     print(f"train examples: {len(dataset['train'])}", file=sys.stderr)
+
+    # Assistant-only loss (consistent with train_lora.py): record the exact system
+    # prompt baked into the data and install the generation-tagged gemma-4 template so
+    # SFTTrainer masks system+user and trains on the assistant turn only. The branch's
+    # _GEMMA4_GEN_TEMPLATE renders byte-identical to the stock template; the helper
+    # raises if the base model isn't gemma-4-shaped, so a prompt mismatch can never train.
+    sample_messages = dataset["train"][0]["messages"]
+    system_prompt = next((m["content"] for m in sample_messages
+                          if m["role"] == "system"), "")
+    enable_assistant_only_loss(tokenizer, sample_messages)
+    # Drop records that would truncate past their assistant turn at this max_seq_len
+    # (else assistant_only_loss + CCE divides by zero on an empty mask).
+    dataset["train"] = drop_overlong_records(dataset["train"], tokenizer,
+                                             args.max_seq_len, "train")
+    if "validation" in dataset:
+        dataset["validation"] = drop_overlong_records(dataset["validation"], tokenizer,
+                                                       args.max_seq_len, "val")
+    has_val = "validation" in dataset
 
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -129,7 +145,9 @@ def main() -> int:
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_length=args.max_seq_len,
-        dataset_text_field="text",
+        # Train on the assistant turn only (mask system+user), via the generation-tagged
+        # template installed above — consistent with train_lora.py.
+        assistant_only_loss=True,
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
@@ -166,24 +184,30 @@ def main() -> int:
     trainer.save_model(str(args.out_dir))
     tokenizer.save_pretrained(str(args.out_dir))
     if trainer.is_world_process_zero():
+        loss_kind = "cut-cross-entropy" if args.cce else "standard cross-entropy"
         write_run_log(args.out_dir, "fsdp", [
             ("base model", args.base_model),
+            ("loss", loss_kind),
             ("max seq len", args.max_seq_len),
             ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
             ("batch / grad-accum", f"{args.batch_size} / {args.grad_accum}"),
             ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
             ("train jsonl", str(args.train_jsonl)),
+            ("assistant-only loss", "True"),
             ("final train loss", f"{result.training_loss:.4f}"),
-        ])
+        ], system_prompt=system_prompt)
         write_run_readme(args.out_dir, "fsdp", args.base_model,
-                         f"bf16 LoRA, FSDP-sharded, max_seq_len {args.max_seq_len}.", [
+                         f"bf16 LoRA, FSDP-sharded, {loss_kind}, max_seq_len {args.max_seq_len}.", [
                              ("precision", "bf16 LoRA"),
+                             ("loss", loss_kind),
                              ("max seq len", args.max_seq_len),
+                             ("dataset", str(args.train_jsonl)),
                              ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
                              ("epochs / effective batch", f"{args.epochs} / {args.batch_size * args.grad_accum}"),
                              ("learning rate", args.lr),
+                             ("assistant-only loss", "True"),
                              ("final train loss", f"{result.training_loss:.4f}"),
-                         ])
+                         ], system_prompt=system_prompt)
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
     return 0
 

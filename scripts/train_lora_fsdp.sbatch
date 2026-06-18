@@ -23,11 +23,11 @@ set -a
 set +a
 
 # Smoke: BASE_MODEL=google/gemma-4-E2B-it MAX_SEQ_LEN=4096 MAX_STEPS=20 NGPU=2
-TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs/train.jsonl}"
-VAL_JSONL="${VAL_JSONL:-data/train_no_docs/val.jsonl}"
+TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs_cap65k/train.jsonl}"
+VAL_JSONL="${VAL_JSONL:-data/train_no_docs_cap65k/val.jsonl}"
 OUT_DIR="${OUT_DIR:-}"             # empty = script auto-names results/YYYYMMDD-HHMMSS
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 16384); needs CCE=1 at this length
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
 NGPU="${NGPU:-4}"

@@ -83,13 +83,18 @@ def split_transcript_by_top(text: str) -> dict[int, str]:
 
 # --- decoding presets ---------------------------------------------------------
 # baseline reproduces the current production defaults (no repetition control);
-# antirep adds the handoff's recommended repetition_penalty + no_repeat_ngram.
-# Only these two knobs differ, to isolate the decoding fix.
+# antirep adds a GENTLE repetition_penalty only. The earlier aggressive preset
+# (repetition_penalty=1.3 + no_repeat_ngram_size=3) over-suppressed: forbidding
+# every repeated 3-gram kills legitimate German phrases ("Der Ausschuss",
+# "Ja : Nein : …") and the model collapsed into character-salad that the
+# ts/tag/maxrep metrics miss. So: mild penalty (1.15), NO n-gram block. This nudges
+# away from hard loops without starving the model of normal repetition.
+# Only these two knobs differ from baseline, to isolate the decoding effect.
 DECODE_PRESETS: dict[str, dict] = {
     "baseline": dict(temperature=0.3, top_p=0.9, max_new_tokens=4096,
                      repetition_penalty=1.0, no_repeat_ngram_size=0, min_new_tokens=0),
     "antirep": dict(temperature=0.3, top_p=0.9, max_new_tokens=4096,
-                    repetition_penalty=1.3, no_repeat_ngram_size=3, min_new_tokens=0),
+                    repetition_penalty=1.15, no_repeat_ngram_size=0, min_new_tokens=0),
 }
 
 

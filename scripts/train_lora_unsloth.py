@@ -169,8 +169,8 @@ def main() -> int:
     # makes SFTTrainer compute loss over the WHOLE sequence (system+user+model), so
     # the model learns to reproduce the transcript — the likely cause of the
     # timestamp/echo degeneration and the implausibly low train loss (~0.12). This
-    # masks everything before each "<start_of_turn>model\n" so loss is computed only
-    # on the assistant response (incl. its trailing <end_of_turn> = EOS to learn).
+    # masks everything before each "<|turn>model\n" so loss is computed only on the
+    # assistant response (incl. its trailing "<turn|>" = EOS to learn).
     from unsloth.chat_templates import train_on_responses_only
     # gemma-4 turn markers are "<|turn>role" / "<turn|>" (NOT the gemma-2/3
     # "<start_of_turn>"). Masking keys on the response marker, so it must match.

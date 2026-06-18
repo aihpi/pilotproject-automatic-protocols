@@ -38,15 +38,14 @@ FINDINGS = """
 - **`ratio` is rough**: gold still contains cover/Anlagen, so ratios understate coverage.
 - **`votes`/`ts` are heuristics** (`ts` counts `[HH:MM`/`(HH:MM`; `votes` needs spaced colons).
 
-### ⚠️ antirep decoding is NOT a clean win (key finding)
-The antirep preset (`repetition_penalty 1.3` + `no_repeat_ngram_size 3`) **reduces the
-metric-visible degeneration** — baseline→antirep deltas show big drops in timestamp
-leaks (unsloth `long_multitop` −276, `short_ARD_1` 139→0) and loops (cce_nodocs_cap65k
-maxrep 11→1) — **but it can replace them with character-salad collapse**: once the
-model can't repeat legitimate German 3-grams ("Der Ausschuss", "Ja : Nein : …"), it
-emits random letters/symbols. Seen in `cce_nodocs_cap32k` `short_ARD_1` antirep.
-→ The preset is **too aggressive**; retune gentler (e.g. `repetition_penalty≈1.15`,
-drop `no_repeat_ngram_size` or raise to ≥4) and re-judge by reading, not metrics.
+### ⚠️ antirep decoding — preset RETUNED (was too aggressive)
+The original antirep preset (`repetition_penalty 1.3` + `no_repeat_ngram_size 3`) reduced
+the metric-visible degeneration (timestamp leaks, loops) **but replaced them with
+character-salad collapse**: once the model can't repeat legitimate German 3-grams
+("Der Ausschuss", "Ja : Nein : …") it emits random letters/symbols (seen in
+`cce_nodocs_cap32k` `short_ARD_1` antirep, which the ts/tag/maxrep metrics scored "clean").
+→ The preset is now **gentle**: `repetition_penalty 1.15`, `no_repeat_ngram_size 0` (off).
+Those v1 salad outputs are archived, not deleted. Re-judge by **reading**, not metrics.
 
 ### Confounds
 - The AIK/AIL/HA outputs mix *different adapters and decode settings* — not yet
@@ -86,8 +85,8 @@ drop `no_repeat_ngram_size` or raise to ≥4) and re-judge by reading, not metri
    cheap lever to test, esp. for off-distribution inputs.
 
 ### Recommended fix order
-1. **Retune the decode preset** — the current `1.3`/`no_repeat_ngram_size=3` causes
-   salad; try `repetition_penalty≈1.15`, no n-gram block (or ≥4), judge by reading.
+1. **Retune the decode preset** — DONE: antirep is now `repetition_penalty 1.15`,
+   `no_repeat_ngram_size 0` (the old `1.3`/`3` caused salad). Judge by reading.
 2. Input cleaning: collapse consecutive duplicate (Whisper) lines before inference.
 3. Output post-processing: strip timestamp lines, de-dupe `## Zu TOP` headings.
 4. Training-side (now landed): **assistant-only loss** (validated) + the hardened

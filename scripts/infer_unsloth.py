@@ -80,9 +80,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--repetition-penalty", type=float, default=1.0,
-                   help="1.0 = off; ~1.3 curbs the echo/repetition loops (handoff)")
+                   help="1.0 = off; a gentle ~1.15 curbs echo loops (1.3 over-suppressed → salad)")
     p.add_argument("--no-repeat-ngram-size", type=int, default=0,
-                   help="0 = off; try 3 to block repeated n-grams (handoff)")
+                   help="0 = off (recommended); small n-gram blocks cause character-salad")
     p.add_argument("--min-new-tokens", type=int, default=0)
     return p.parse_args()
 
