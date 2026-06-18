@@ -38,9 +38,12 @@ dependencies = [
 ]
 
 # Alternative LoRA training stacks (branch fix/LoRA_alternative_implementations).
-# Each is an isolated extra: install only the one a given sbatch needs
-# (uv run --extra <name>). They pull heavier / pinned deps; if a resolver clash
-# with the base torch stack appears, build that extra in a dedicated venv instead.
+# NOTE: these are a DEPENDENCY RECORD only — they are NOT installed via `uv run
+# --extra`. `uv` co-resolves base deps with the extra, and axolotl/keras pin
+# older torch+numpy that conflict with the base (torch>=2.11, numpy>=2.4.4,
+# liger) → unsatisfiable. Each framework is instead built as a standalone venv
+# (.venv-unsloth/.venv-keras/.venv-axolotl) outside the resolver; FSDP reuses the
+# base venv. See LORA_ALTERNATIVES.md for the build commands.
 [project.optional-dependencies]
 unsloth = [
     "unsloth>=2025.1.1",

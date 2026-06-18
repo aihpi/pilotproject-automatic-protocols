@@ -30,7 +30,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-jsonl", required=True, type=Path)
     p.add_argument("--val-jsonl", type=Path, default=None)
     p.add_argument("--base-model", default="google/gemma-4-E2B-it")
-    p.add_argument("--out-dir", type=Path, default=Path("results/fsdp_lora"))
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Run folder. Default: auto-named results/YYYYMMDD-HHMMSS")
     p.add_argument("--max-seq-len", type=int, default=16384,
                    help="Start reduced (8k-16k): sharding doesn't fix the logits term")
     p.add_argument("--lora-r", type=int, default=16)
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-scheduler", default="cosine")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cce", action="store_true",
+                   help="Use cut-cross-entropy: patch the gemma-4 wrapper forward so the "
+                        "seq×vocab(262144) logits tensor is never materialised. FSDP shards the "
+                        "weights but NOT this logits term, so --cce is required for cap 32768 / "
+                        "uncapped. Needs the cut-cross-entropy package (in the base venv).")
     return p.parse_args()
 
 
@@ -63,9 +69,18 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
+    from alt_utils import resolve_out_dir, write_run_log, write_run_readme, render_chat
+
+    args.out_dir = resolve_out_dir(args.out_dir)
+
+    if args.cce:
+        # Patch the wrapper forward BEFORE loading so the loss path uses cut-cross-entropy
+        # (no full seq×vocab logits). Required for FSDP at cap 32768 / uncapped.
+        from gemma4_cce_patch import patch_gemma4_conditional_generation_cce
+        patch_gemma4_conditional_generation_cce()
 
     print(f"loading {args.base_model} (no device_map; accelerate/FSDP shards it), "
-          f"max_seq_len={args.max_seq_len}", file=sys.stderr, flush=True)
+          f"max_seq_len={args.max_seq_len}, cce={args.cce}", file=sys.stderr, flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         dtype=torch.bfloat16,
@@ -84,6 +99,11 @@ def main() -> int:
     if args.val_jsonl and args.val_jsonl.exists():
         data_files["validation"] = str(args.val_jsonl)
     dataset = load_dataset("json", data_files=data_files)
+    # Pre-render chat 'messages' to a plain 'text' column (the Gemma template needs
+    # typed-parts content; doing it here avoids trl's assistant_only_loss path, which
+    # requires {% generation %} markers the Gemma template lacks).
+    dataset = dataset.map(lambda ex: {"text": render_chat(tokenizer, ex["messages"])},
+                          remove_columns=["messages", "meta"])
     has_val = "validation" in dataset
     print(f"train examples: {len(dataset['train'])}", file=sys.stderr)
 
@@ -109,16 +129,28 @@ def main() -> int:
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_length=args.max_seq_len,
-        assistant_only_loss=True,
+        dataset_text_field="text",
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
+        # CCE returns logits=None; eval must be loss-only or the metric path crashes.
+        prediction_loss_only=args.cce,
         report_to="tensorboard",
         seed=args.seed,
         dataset_num_proc=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
 
-    trainer = SFTTrainer(
+    class _LossOnlySFTTrainer(SFTTrainer):
+        """compute_loss without touching outputs.logits (CCE returns logits=None, which
+        TRL's default token-accuracy metric would crash on). Mirrors train_lora.py."""
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            inputs.pop("_prediction_loss_only", None)
+            outputs = model(**inputs)
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+    trainer_cls = _LossOnlySFTTrainer if args.cce else SFTTrainer
+    trainer = trainer_cls(
         model=model,
         args=sft_config,
         train_dataset=dataset["train"],
@@ -133,6 +165,25 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(args.out_dir))
     tokenizer.save_pretrained(str(args.out_dir))
+    if trainer.is_world_process_zero():
+        write_run_log(args.out_dir, "fsdp", [
+            ("base model", args.base_model),
+            ("max seq len", args.max_seq_len),
+            ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
+            ("batch / grad-accum", f"{args.batch_size} / {args.grad_accum}"),
+            ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
+            ("train jsonl", str(args.train_jsonl)),
+            ("final train loss", f"{result.training_loss:.4f}"),
+        ])
+        write_run_readme(args.out_dir, "fsdp", args.base_model,
+                         f"bf16 LoRA, FSDP-sharded, max_seq_len {args.max_seq_len}.", [
+                             ("precision", "bf16 LoRA"),
+                             ("max seq len", args.max_seq_len),
+                             ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
+                             ("epochs / effective batch", f"{args.epochs} / {args.batch_size * args.grad_accum}"),
+                             ("learning rate", args.lr),
+                             ("final train loss", f"{result.training_loss:.4f}"),
+                         ])
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
     return 0
 

@@ -33,7 +33,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-model", default="google/gemma-4-E2B-it",
                    help="HF id or local path (default: small model for smoke; scale to "
                         "google/gemma-4-31B-it). Unsloth also accepts unsloth/* 4-bit repos.")
-    p.add_argument("--out-dir", type=Path, default=Path("results/unsloth_lora"))
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Run folder. Default: auto-named results/YYYYMMDD-HHMMSS")
     p.add_argument("--max-seq-len", type=int, default=32768)
     p.add_argument("--load-in-4bit", action="store_true", default=True,
                    help="QLoRA 4-bit (default for single-GPU 31B). Use --no-4bit for bf16.")
@@ -66,6 +67,9 @@ def main() -> int:
     import torch
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
+    from alt_utils import resolve_out_dir, write_run_log, write_run_readme
+
+    args.out_dir = resolve_out_dir(args.out_dir)
 
     print(f"loading {args.base_model} via Unsloth "
           f"(4bit={args.load_in_4bit}, max_seq_len={args.max_seq_len})", file=sys.stderr, flush=True)
@@ -108,8 +112,6 @@ def main() -> int:
         weight_decay=args.weight_decay,
         bf16=not args.load_in_4bit,  # 4-bit compute is bf16 internally; let Unsloth pick
         max_length=args.max_seq_len,
-        # loss on the assistant turn only (mask the system+transcript prompt)
-        assistant_only_loss=True,
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
@@ -119,12 +121,44 @@ def main() -> int:
         dataset_num_proc=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
 
+    # Unsloth's SFTTrainer wrapper doesn't auto-consume the chat 'messages' column,
+    # so render each conversation to a string via the tokenizer's chat template.
+    # (Minimal: loss over the whole string. Escalation: mask the prompt with a
+    # template carrying {% generation %} tags + assistant_only_loss=True.)
+    def to_convo(msgs):
+        # Gemma-4's chat template needs content as a list of typed parts and folds
+        # the system prompt into the user turn. Build a 2-turn user/model convo.
+        sys_txt = "".join(m["content"] for m in msgs if m["role"] == "system")
+        user_txt = "".join(m["content"] for m in msgs if m["role"] == "user")
+        model_txt = "".join(m["content"] for m in msgs if m["role"] == "assistant")
+        user_full = (sys_txt + "\n\n" + user_txt).strip() if sys_txt else user_txt
+        return [
+            {"role": "user", "content": [{"type": "text", "text": user_full}]},
+            {"role": "model", "content": [{"type": "text", "text": model_txt}]},
+        ]
+
+    def _render(convo):
+        return tokenizer.apply_chat_template(to_convo(convo), tokenize=False,
+                                             add_generation_prompt=False)
+
+    def formatting_func(ex):
+        # Unsloth probes with a single example (messages = one conversation: list
+        # of message dicts) and later maps with a batch (messages = list of
+        # conversations). Return a string for the former, a list for the latter.
+        m = ex["messages"]
+        # Always return a list of strings (Unsloth requires it). Single example:
+        # messages is one conversation (m[0] is a dict) -> wrap as a 1-element list.
+        if m and isinstance(m[0], dict):
+            return [_render(m)]
+        return [_render(c) for c in m]
+
     trainer = SFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("validation"),
         processing_class=tokenizer,
+        formatting_func=formatting_func,
     )
 
     result = trainer.train()
@@ -133,6 +167,26 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.out_dir))       # LoRA adapter
     tokenizer.save_pretrained(str(args.out_dir))
+    write_run_log(args.out_dir, "unsloth", [
+        ("base model", args.base_model),
+        ("bits", "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"),
+        ("max seq len", args.max_seq_len),
+        ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
+        ("batch / grad-accum", f"{args.batch_size} / {args.grad_accum}"),
+        ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
+        ("train jsonl", str(args.train_jsonl)),
+        ("final train loss", f"{result.training_loss:.4f}"),
+    ])
+    bits = "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"
+    write_run_readme(args.out_dir, "unsloth", args.base_model,
+                     f"{bits}, single-GPU fused CE, max_seq_len {args.max_seq_len}.", [
+                         ("precision", bits),
+                         ("max seq len", args.max_seq_len),
+                         ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
+                         ("epochs / effective batch", f"{args.epochs} / {args.batch_size * args.grad_accum}"),
+                         ("learning rate", args.lr),
+                         ("final train loss", f"{result.training_loss:.4f}"),
+                     ])
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
     _ = torch  # silence unused if branch skips bf16
     return 0

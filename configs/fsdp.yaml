@@ -1,6 +1,10 @@
-# accelerate FSDP full-shard config for scripts/train_lora_fsdp.py.
+# accelerate FSDP (v1) full-shard config for scripts/train_lora_fsdp.py.
 # Usage: accelerate launch --config_file configs/fsdp.yaml scripts/train_lora_fsdp.py ...
 # num_processes is overridden on the CLI to match --gres GPUs.
+#
+# FSDP1 (not v2): FSDP2 wraps params as DTensors and breaks PEFT LoRA adapters
+# ('Tensor' object has no attribute 'device_mesh'). FSDP1 + fsdp_use_orig_params
+# is the compatible path for LoRA.
 compute_environment: LOCAL_MACHINE
 distributed_type: FSDP
 mixed_precision: bf16
@@ -11,11 +15,13 @@ num_processes: 4          # override: accelerate launch --num_processes <#GPUs>
 rdzv_backend: static
 same_network: true
 fsdp_config:
-  fsdp_version: 2
   fsdp_sharding_strategy: FULL_SHARD          # shard params + grads + optimizer (ZeRO-3 equiv)
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_transformer_layer_cls_to_wrap: Gemma4TextDecoderLayer   # explicit (auto-detect fails on the gemma-4 multimodal wrapper at 31B)
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_state_dict_type: FULL_STATE_DICT       # consolidated save -> loadable PEFT adapter_model.safetensors (SHARDED writes full-model .distcp shards, unusable for infer/compare)
   fsdp_offload_params: false                  # set true to spill to CPU if still OOM
   fsdp_use_orig_params: true                  # required for PEFT/LoRA frozen-base params
   fsdp_cpu_ram_efficient_loading: true
-  fsdp_activation_checkpointing: false        # SFTConfig handles gradient checkpointing
+  fsdp_sync_module_states: true

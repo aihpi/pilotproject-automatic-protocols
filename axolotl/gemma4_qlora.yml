@@ -46,10 +46,11 @@ lora_target_modules:
   - down_proj
 
 gradient_checkpointing: true
+cut_cross_entropy: true       # avoid materialising the seq x 262144 logits tensor (the OOM root cause)
 gradient_accumulation_steps: 16
 micro_batch_size: 1
 num_epochs: 3
-optimizer: adamw_8bit
+optimizer: adamw_torch_8bit   # FSDP2 rejects bitsandbytes adamw_8bit; use the torch 8-bit optim
 lr_scheduler: cosine
 learning_rate: 0.0002
 warmup_ratio: 0.03
@@ -59,16 +60,17 @@ seed: 42
 output_dir: results/axolotl_lora
 logging_steps: 1
 saves_per_epoch: 1
-flash_attention: true
+flash_attention: false        # gemma-4 head_dim > 256: FlashAttention/SDPA-flash kernel rejects it
+eager_attention: true         # force eager attention (avoids the flash SDPA backend)
 
 # Shard across GPUs (frees GPU 0). Override --num_processes to match --gres.
 fsdp:
   - full_shard
   - auto_wrap
 fsdp_config:
-  fsdp_version: 2
-  fsdp_transformer_layer_cls_to_wrap: Gemma4DecoderLayer
-  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_version: 1                                              # FSDP2 + 4-bit QLoRA gathers full params -> OOM; v1 shards correctly
+  fsdp_transformer_layer_cls_to_wrap: Gemma4TextDecoderLayer   # verified class name in transformers gemma4
+  fsdp_state_dict_type: FULL_STATE_DICT
   fsdp_use_orig_params: true
 
 # --- Escalation for the 162k-token uncapped records (uncomment) -------------
