@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Add issue to AIHPI project board
-        uses: actions/add-to-project@v0.3.0
+        uses: actions/add-to-project@v1
         with:
           project-url: https://github.com/orgs/aihpi/projects/3
           github-token: ${{ secrets.ADD_ISSUE_TO_PROJECT }}
