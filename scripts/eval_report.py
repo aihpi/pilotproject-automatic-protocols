@@ -17,6 +17,14 @@ from pathlib import Path
 import eval_io
 
 TEST_DIR = Path("data/test")
+EXAMPLES_DIR = TEST_DIR / "examples"       # stable inputs + symlinked gold
+
+
+def latest_run_dir() -> Path | None:
+    """Most recent eval-run folder data/test/<YYYYMMDD-HHMMSS>/ (digit-led name)."""
+    cands = sorted((p for p in TEST_DIR.iterdir()
+                    if p.is_dir() and p.name[:1].isdigit()), reverse=True)
+    return cands[0] if cands else None
 
 # Static, human-written findings appended to the report (survives regeneration).
 FINDINGS = """
@@ -113,10 +121,10 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     return meta, text
 
 
-def gold_words(example_dir: Path) -> int:
-    g = sorted(example_dir.glob("*_Protokoll.md"))                 # my dirs: symlinked gold
-    if not g:                                                      # user val dirs: derive stem
-        cand = Path("data/protocols/md") / f"{example_dir.name}_Protokoll.md"
+def gold_words(example_name: str) -> int:
+    g = sorted((EXAMPLES_DIR / example_name).glob("*_Protokoll.md"))   # symlinked gold
+    if not g:                                                          # fallback: derive stem
+        cand = Path("data/protocols/md") / f"{example_name}_Protokoll.md"
         if cand.exists():
             g = [cand]
     if not g:
@@ -137,34 +145,33 @@ def _framework_from_name(name: str) -> str:
 
 
 def main() -> int:
-    if not TEST_DIR.is_dir():
-        print("no data/test", file=sys.stderr)
+    # Run folder: argv[1] if given, else the most recent data/test/<ts>/.
+    run_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else latest_run_dir()
+    if not run_dir or not run_dir.is_dir():
+        print("no eval-run folder under data/test/ (pass one as argv[1], "
+              "e.g. data/test/20260619-101010)", file=sys.stderr)
         return 1
     rows = []  # (example, adapter, framework, decode, metrics, ratio)
-    for ex in sorted(p for p in TEST_DIR.iterdir() if p.is_dir()):
-        sm = ex / "summaries"
-        if not sm.is_dir():
-            continue
-        gw = gold_words(ex) or 1
-        # two schemes: my flat 'summaries/<id>__fw__gran__decode.md', and the
-        # earlier 'summaries/<adapter>/protocol.md' (nested, no decode tag).
-        files = [(f, f.stem, None) for f in sorted(sm.glob("*.md")) if f.name != "README.md"]
-        files += [(f, f.parent.name, "n/a") for f in sorted(sm.glob("*/protocol.md"))]
-        for f, label, decode_override in files:
+    for ex in sorted(p for p in run_dir.iterdir() if p.is_dir()):
+        gw = gold_words(ex.name) or 1
+        # flat scheme written by eval_lora: '<id>__<fw>__<gran>__<decode>.md'
+        for f in sorted(ex.glob("*.md")):
+            if f.name in ("README.md", "COMPARISON.md"):
+                continue
             meta, body = parse_front_matter(f.read_text(encoding="utf-8"))
             m = eval_io.degeneration_metrics(body)
-            adapter = meta.get("adapter_id", label)
+            adapter = meta.get("adapter_id", f.stem)
             rows.append({
                 "example": ex.name,
                 "adapter": adapter,
-                "framework": meta.get("framework", _framework_from_name(label)),
-                "decode": meta.get("decode", decode_override or "?"),
+                "framework": meta.get("framework", _framework_from_name(f.stem)),
+                "decode": meta.get("decode", "?"),
                 "ratio": m["words"] / gw,
                 **m,
             })
 
     if not rows:
-        print("no summaries found under data/test/*/summaries/", file=sys.stderr)
+        print(f"no summaries found under {run_dir}/<example>/*.md", file=sys.stderr)
         return 1
 
     out = ["# LoRA evaluation — output comparison",
@@ -212,8 +219,8 @@ def main() -> int:
 
     out.append(FINDINGS.strip())
     out.append("")
-    Path(TEST_DIR / "COMPARISON.md").write_text("\n".join(out) + "\n", encoding="utf-8")
-    print(f"wrote {TEST_DIR/'COMPARISON.md'} ({len(rows)} summaries)")
+    (run_dir / "COMPARISON.md").write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"wrote {run_dir/'COMPARISON.md'} ({len(rows)} summaries)")
     return 0
 
 

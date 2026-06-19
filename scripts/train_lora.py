@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
                         "needs the cut-cross-entropy package. See scripts/gemma4_cce_patch.py.")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
-    p.add_argument("--early-stopping-patience", type=int, default=2,
+    p.add_argument("--early-stopping-patience", type=int, default=3,
                    help="Stop after N evals without eval_loss improvement and keep the best "
                         "model (default: 2; only active with a validation set)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")

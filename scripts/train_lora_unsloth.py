@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-scheduler", default="cosine")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--early-stopping-patience", type=int, default=3,
+                   help="Stop after N evals without eval_loss improvement; keep the best "
+                        "checkpoint (needs a val set). 0 disables. Inert at epochs=1.")
     return p.parse_args()
 
 
@@ -119,6 +122,11 @@ def main() -> int:
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
+        # keep the BEST eval_loss checkpoint (not the last/most-overfit), like train_lora.py
+        load_best_model_at_end=has_val,
+        metric_for_best_model="eval_loss" if has_val else None,
+        greater_is_better=False if has_val else None,
+        save_total_limit=2,
         optim="adamw_8bit",
         report_to="tensorboard",
         seed=args.seed,
@@ -180,10 +188,20 @@ def main() -> int:
         response_part="<|turn>model\n",
     )
 
+    # Early stopping (keep the best eval_loss checkpoint). Needs a val set; inert at epochs=1.
+    if has_val and args.early_stopping_patience > 0:
+        from transformers import EarlyStoppingCallback
+        trainer.add_callback(EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience))
+
     result = trainer.train()
-    print(f"final train loss: {result.training_loss:.4f}", file=sys.stderr)
-    print("note: train loss now reflects assistant-only tokens (expect HIGHER than "
-          "the unmasked ~0.12; that is correct, not a regression)", file=sys.stderr)
+    best_eval = trainer.state.best_metric if has_val else None
+    best_eval_s = f"{best_eval:.4f}" if isinstance(best_eval, (int, float)) else "-"
+    print(f"final train loss: {result.training_loss:.4f} | best eval_loss: {best_eval_s}",
+          file=sys.stderr)
+    print("note: train loss reflects assistant-only tokens; the SAVED adapter is the best "
+          "eval_loss checkpoint (load_best_model_at_end), not necessarily the last.",
+          file=sys.stderr)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.out_dir))       # LoRA adapter
@@ -197,7 +215,9 @@ def main() -> int:
         ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
         ("train jsonl", str(args.train_jsonl)),
         ("assistant-only loss", "True (train_on_responses_only)"),
+        ("early-stopping patience", args.early_stopping_patience if has_val else "n/a (no val)"),
         ("final train loss", f"{result.training_loss:.4f}"),
+        ("best eval_loss", best_eval_s),
     ], system_prompt=system_prompt)
     bits = "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"
     write_run_readme(args.out_dir, "unsloth", args.base_model,
@@ -209,6 +229,7 @@ def main() -> int:
                          ("learning rate", args.lr),
                          ("assistant-only loss", "True (train_on_responses_only)"),
                          ("final train loss", f"{result.training_loss:.4f}"),
+                         ("best eval_loss", best_eval_s),
                      ], system_prompt=system_prompt)
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
     _ = torch  # silence unused if branch skips bf16

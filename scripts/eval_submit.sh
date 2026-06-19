@@ -15,7 +15,11 @@ REG="${REG:-tmp/lora_eval/registry.tsv}"
 FILTER="${1:-}"
 TIME="${TIME:-08:00:00}"
 PARTITION="${PARTITION:-}"        # empty = sbatch default (aisc-batch)
-mkdir -p logs tmp/lora_eval
+# One shared run folder for the whole matrix (like results/<ts>/): every adapter
+# job writes into data/test/$RUN_ID/. Override RUN_ID to add to an existing run.
+RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+mkdir -p logs tmp/lora_eval "data/test/$RUN_ID"
+echo "eval run folder: data/test/$RUN_ID"
 
 if [ "${SMOKE:-0}" = "1" ]; then
   : "${SMOKE_ID:=cce_nodocs_cap32k}"
@@ -42,7 +46,7 @@ while IFS=$'\t' read -r id fw adapter base bits maxseq gpus py preset rank decod
 
   export FRAMEWORK="$fw" ADAPTER="$adapter" ADAPTER_ID="$id" BASE_MODEL="$base" \
          BITS="$bits" MAX_SEQ_LEN="$maxseq" DECODES="$decodes" PY="$py" \
-         PRESET="$preset" LORA_RANK="$rank" ONLY="${ONLY:-}"
+         PRESET="$preset" LORA_RANK="$rank" ONLY="${ONLY:-}" RUN_ID="$RUN_ID"
 
   args=(--gres="gpu:h100:$gpus" --time="$TIME" --job-name="eval_${id}" --export=ALL)
   [ -n "$PARTITION" ] && args+=(--partition="$PARTITION")

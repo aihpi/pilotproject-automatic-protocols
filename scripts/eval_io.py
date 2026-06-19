@@ -90,10 +90,15 @@ def split_transcript_by_top(text: str) -> dict[int, str]:
 # ts/tag/maxrep metrics miss. So: mild penalty (1.15), NO n-gram block. This nudges
 # away from hard loops without starving the model of normal repetition.
 # Only these two knobs differ from baseline, to isolate the decoding effect.
+# max_new_tokens is the per-TOP OUTPUT budget (per-top granularity → a full protocol
+# can be many × this). Set ABOVE the longest per-TOP training target (4761 tokens in
+# data/train_*_cap65k) so a legitimate long section is never clipped: 4761 → 6144
+# (next 1024 above + margin). Only ever *reached* when a model fails to emit EOS
+# (a degenerate adapter), so raising it is free for well-behaved adapters.
 DECODE_PRESETS: dict[str, dict] = {
-    "baseline": dict(temperature=0.3, top_p=0.9, max_new_tokens=4096,
+    "baseline": dict(temperature=0.3, top_p=0.9, max_new_tokens=6144,
                      repetition_penalty=1.0, no_repeat_ngram_size=0, min_new_tokens=0),
-    "antirep": dict(temperature=0.3, top_p=0.9, max_new_tokens=4096,
+    "antirep": dict(temperature=0.3, top_p=0.9, max_new_tokens=6144,
                     repetition_penalty=1.15, no_repeat_ngram_size=0, min_new_tokens=0),
 }
 
@@ -103,25 +108,30 @@ DECODE_PRESETS: dict[str, dict] = {
 class Example:
     name: str
     transcript_path: Path
-    summaries_dir: Path
+    gold_path: Path | None
 
 
-def discover_examples(test_dir: Path) -> list[Example]:
+def discover_examples(examples_dir: Path) -> list[Example]:
+    """Find evaluation examples under ``examples_dir`` (one folder per example,
+    each with a ``*_Transkript.md`` input and optional ``*_Protokoll.md`` gold)."""
     out: list[Example] = []
-    for sub in (p for p in test_dir.iterdir() if p.is_dir()):
+    for sub in (p for p in examples_dir.iterdir() if p.is_dir()):
         tx = sorted(sub.glob("*_Transkript.md"))
         if not tx:
             continue
-        out.append(Example(sub.name, tx[0], sub / "summaries"))
+        gold = sorted(sub.glob("*_Protokoll.md"))
+        out.append(Example(sub.name, tx[0], gold[0] if gold else None))
     # shortest transcript first: cheap examples produce outputs early, so a job
     # that hits its time limit still leaves the small results behind.
     out.sort(key=lambda e: e.transcript_path.stat().st_size)
     return out
 
 
-def result_path(summaries_dir: Path, adapter_id: str, framework: str,
+def result_path(run_dir: Path, example_name: str, adapter_id: str, framework: str,
                 granularity: str, decode: str) -> Path:
-    return summaries_dir / f"{adapter_id}__{framework}__{granularity}__{decode}.md"
+    # one run folder per eval-matrix run (like results/<ts>/): outputs grouped by
+    # example, named <adapter>__<fw>__<granularity>__<decode>.md.
+    return run_dir / example_name / f"{adapter_id}__{framework}__{granularity}__{decode}.md"
 
 
 def write_summary(out_path: Path, *, meta: dict, body: str) -> None:
@@ -150,27 +160,30 @@ def summarise(transcript: str, granularity: str,
 
 def run_test_set(generate_fn: Callable[[str, str, dict], str], *,
                  adapter_id: str, framework: str, base_model: str,
-                 granularity: str, test_dir: Path, decodes: list[str],
+                 granularity: str, examples_dir: Path, run_dir: Path,
+                 decodes: list[str],
                  system: str = DEFAULT_SYSTEM_PROMPT, overwrite: bool = False,
                  only: str | None = None, log=print) -> list[Path]:
-    """For each example x decode preset: summarise and write to summaries/.
+    """For each example x decode preset: summarise and write under ``run_dir``.
 
+    Inputs come from ``examples_dir/<example>/`` (stable), outputs go to
+    ``run_dir/<example>/`` (one timestamped folder per eval-matrix run).
     ``generate_fn(system, user_text, decode_kwargs) -> str`` is supplied by the
     backend (PEFT / Unsloth / Keras). Skips outputs that already exist unless
     ``overwrite``. Returns the list of written paths.
     """
-    examples = discover_examples(test_dir)
+    examples = discover_examples(examples_dir)
     if only:
         examples = [e for e in examples if only in e.name]
     if not examples:
-        raise SystemExit(f"no examples with *_Transkript.md under {test_dir}"
+        raise SystemExit(f"no examples with *_Transkript.md under {examples_dir}"
                          + (f" matching {only!r}" if only else ""))
     written: list[Path] = []
     for ex in examples:
         transcript = strip_front_matter(ex.transcript_path.read_text(encoding="utf-8"))
         for decode in decodes:
             kwargs = DECODE_PRESETS[decode]
-            out = result_path(ex.summaries_dir, adapter_id, framework, granularity, decode)
+            out = result_path(run_dir, ex.name, adapter_id, framework, granularity, decode)
             if out.exists() and not overwrite:
                 log(f"skip (exists) {out.name}")
                 continue

@@ -51,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-scheduler", default="cosine")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--early-stopping-patience", type=int, default=3,
+                   help="Stop after N evals without eval_loss improvement; keep the best "
+                        "checkpoint (needs a val set). 0 disables.")
     p.add_argument("--cce", action="store_true",
                    help="Use cut-cross-entropy: patch the gemma-4 wrapper forward so the "
                         "seq×vocab(262144) logits tensor is never materialised. FSDP shards the "
@@ -76,6 +79,13 @@ def main() -> int:
     from train_lora import enable_assistant_only_loss, drop_overlong_records
 
     args.out_dir = resolve_out_dir(args.out_dir)
+
+    # cuDNN's fused multi-head-attention SDPA kernel intermittently fails in the
+    # backward pass at long seq len under FSDP ("mha_graph.execute(...).is_good()
+    # to be true, but got false") — the per-batch variable seq length builds a new
+    # cuDNN graph each step and some shape trips the bug. Disable the cuDNN SDPA
+    # backend so attention falls back to the flash / mem-efficient kernels.
+    torch.backends.cuda.enable_cudnn_sdp(False)
 
     if args.cce:
         # Patch the wrapper forward BEFORE loading so the loss path uses cut-cross-entropy
@@ -151,6 +161,11 @@ def main() -> int:
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
+        # keep the BEST eval_loss checkpoint (not the last), like train_lora.py
+        load_best_model_at_end=has_val,
+        metric_for_best_model="eval_loss" if has_val else None,
+        greater_is_better=False if has_val else None,
+        save_total_limit=2,
         # CCE returns logits=None; eval must be loss-only or the metric path crashes.
         prediction_loss_only=args.cce,
         report_to="tensorboard",
@@ -177,8 +192,17 @@ def main() -> int:
         processing_class=tokenizer,
     )
 
+    # Early stopping (keep the best eval_loss checkpoint). Needs a val set.
+    if has_val and args.early_stopping_patience > 0:
+        from transformers import EarlyStoppingCallback
+        trainer.add_callback(EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience))
+
     result = trainer.train()
-    print(f"final train loss: {result.training_loss:.4f}", file=sys.stderr)
+    best_eval = trainer.state.best_metric if has_val else None
+    best_eval_s = f"{best_eval:.4f}" if isinstance(best_eval, (int, float)) else "-"
+    print(f"final train loss: {result.training_loss:.4f} | best eval_loss: {best_eval_s}",
+          file=sys.stderr)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(args.out_dir))
@@ -194,7 +218,9 @@ def main() -> int:
             ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
             ("train jsonl", str(args.train_jsonl)),
             ("assistant-only loss", "True"),
+            ("early-stopping patience", args.early_stopping_patience if has_val else "n/a (no val)"),
             ("final train loss", f"{result.training_loss:.4f}"),
+            ("best eval_loss", best_eval_s),
         ], system_prompt=system_prompt)
         write_run_readme(args.out_dir, "fsdp", args.base_model,
                          f"bf16 LoRA, FSDP-sharded, {loss_kind}, max_seq_len {args.max_seq_len}.", [
@@ -207,6 +233,7 @@ def main() -> int:
                              ("learning rate", args.lr),
                              ("assistant-only loss", "True"),
                              ("final train loss", f"{result.training_loss:.4f}"),
+                             ("best eval_loss", best_eval_s),
                          ], system_prompt=system_prompt)
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
     return 0

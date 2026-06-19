@@ -34,6 +34,7 @@ GRAN="${GRAN:-per-top}"
 DECODES="${DECODES:-baseline,antirep}"
 ONLY="${ONLY:-}"
 PRESET="${PRESET:-}"
+RUN_ID="${RUN_ID:-}"                    # shared per-matrix run id -> data/test/<RUN_ID>/
 LORA_RANK="${LORA_RANK:-8}"
 PY="${PY:-uv run python}"              # peft: 'uv run python'; alt: abs venv python
 
@@ -51,6 +52,7 @@ opt=()
 [ -n "$BASE_MODEL" ] && opt+=(--base-model "$BASE_MODEL")
 [ -n "$PRESET" ]     && opt+=(--preset "$PRESET")
 [ -n "$ONLY" ]       && opt+=(--only "$ONLY")
+[ -n "$RUN_ID" ]     && opt+=(--run-dir "data/test/$RUN_ID")
 
 echo "[$(date -Is)] FRAMEWORK=$FRAMEWORK ADAPTER=$ADAPTER ID=$ADAPTER_ID BITS=$BITS MAXSEQ=$MAX_SEQ_LEN DECODES=$DECODES PY=$PY"
 $PY scripts/eval_lora.py \

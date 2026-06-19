@@ -76,7 +76,9 @@ def parse_args() -> argparse.Namespace:
                    help="per-top (default, matches training; short inputs avoid OOM) or document")
     p.add_argument("--max-seq-len", type=int, default=65536,
                    help="Max prompt length before truncation (default: 65536, 65k)")
-    p.add_argument("--max-new-tokens", type=int, default=4096)
+    p.add_argument("--max-new-tokens", type=int, default=6144,
+                   help="Max generated tokens per call (default: 6144 — above the longest "
+                        "per-TOP training target, 4761)")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--repetition-penalty", type=float, default=1.0,

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import eval_io
@@ -67,6 +68,12 @@ def backend_peft(args):
     print(f"[peft] attaching adapter {args.adapter}", file=sys.stderr, flush=True)
     model = PeftModel.from_pretrained(model, str(args.adapter))
     model.eval()
+    # EOS fix: gemma-4 ends a turn with "<turn|>" (id 106), not the base <eos>. Without
+    # it generate() never stops at the section end and runs to max_new_tokens every time
+    # (slow + bloated output). Stop on either. (Same fix as the unsloth backend.)
+    _eot = tok.convert_tokens_to_ids("<turn|>")
+    eos_ids = [i for i in (tok.eos_token_id, _eot)
+               if isinstance(i, int) and i >= 0 and i != tok.unk_token_id]
 
     def generate_fn(system: str, user: str, k: dict) -> str:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -87,7 +94,7 @@ def backend_peft(args):
                 temperature=k["temperature"] if k["temperature"] > 0 else None,
                 top_p=k["top_p"], repetition_penalty=k["repetition_penalty"],
                 no_repeat_ngram_size=k["no_repeat_ngram_size"],
-                pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
+                pad_token_id=tok.pad_token_id, eos_token_id=eos_ids or None)
         return tok.decode(out[0, ids.shape[-1]:], skip_special_tokens=True).strip()
 
     return generate_fn, str(base)
@@ -104,12 +111,15 @@ def backend_unsloth(args):
                                            load_in_4bit=True)
     FastModel.for_inference(model)
     base = _read_base_from_adapter(args.adapter) or "unsloth-adapter"
+    # FastModel returns gemma-4's multimodal `Gemma4Processor`; token-id ops + decode
+    # live on the wrapped `.tokenizer`, while apply_chat_template stays on the processor.
+    tk = getattr(tok, "tokenizer", tok)
     # EOS fix: gemma-4 ends a turn with "<turn|>" (id 106), not "<end_of_turn>"
     # (which isn't even a single token here) nor only the base <eos>. Stop on either,
     # else generation runs to max_new_tokens and the tail fills with repetition.
-    eot = tok.convert_tokens_to_ids("<turn|>")
-    eos_ids = [i for i in (tok.eos_token_id, eot)
-               if isinstance(i, int) and i >= 0 and i != tok.unk_token_id]
+    eot = tk.convert_tokens_to_ids("<turn|>")
+    eos_ids = [i for i in (tk.eos_token_id, eot)
+               if isinstance(i, int) and i >= 0 and i != tk.unk_token_id]
 
     def generate_fn(system: str, user: str, k: dict) -> str:
         # Unsloth's Gemma tokenizer uses the multimodal chat template, which
@@ -118,18 +128,20 @@ def backend_unsloth(args):
         # the original infer_unsloth.py did). PEFT keeps a proper system role.
         convo = [{"role": "user", "content": [{"type": "text",
                   "text": (system + "\n\n" + user).strip()}]}]
-        ids = tok.apply_chat_template(convo, add_generation_prompt=True, tokenize=True,
-                                      return_tensors="pt", truncation=True,
+        # return_dict=True: the processor returns a BatchFeature, not a bare tensor.
+        enc = tok.apply_chat_template(convo, add_generation_prompt=True, tokenize=True,
+                                      return_dict=True, return_tensors="pt", truncation=True,
                                       max_length=max(256, args.max_seq_len - k["max_new_tokens"]))
-        ids = ids.to(model.device)
+        enc = {kk: vv.to(model.device) for kk, vv in enc.items() if hasattr(vv, "to")}
+        n_in = enc["input_ids"].shape[1]
         out = model.generate(
-            input_ids=ids, max_new_tokens=k["max_new_tokens"], min_new_tokens=k["min_new_tokens"],
+            **enc, max_new_tokens=k["max_new_tokens"], min_new_tokens=k["min_new_tokens"],
             do_sample=k["temperature"] > 0,
             temperature=k["temperature"] if k["temperature"] > 0 else None,
             top_p=k["top_p"], repetition_penalty=k["repetition_penalty"],
             no_repeat_ngram_size=k["no_repeat_ngram_size"],
             eos_token_id=eos_ids or None)
-        return tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
+        return tk.decode(out[0][n_in:], skip_special_tokens=True).strip()
 
     return generate_fn, str(base)
 
@@ -182,7 +194,13 @@ def main() -> int:
     p.add_argument("--max-seq-len", type=int, default=65536,
                    help="Prompt truncation budget (default: 65536, 65k); mirror the "
                         "adapter's training cap")
-    p.add_argument("--test-dir", type=Path, default=Path("data/test"))
+    p.add_argument("--examples-dir", type=Path, default=Path("data/test/examples"),
+                   help="Stable example inputs (one folder per example with "
+                        "*_Transkript.md + *_Protokoll.md)")
+    p.add_argument("--run-dir", type=Path, default=None,
+                   help="Output folder for this eval run (default: data/test/<UTC ts>). "
+                        "The eval matrix passes a shared timestamp so all adapters land "
+                        "in one run folder, mirroring results/<ts>/.")
     p.add_argument("--decodes", default="baseline,antirep",
                    help="Comma list of decode presets (default: baseline,antirep)")
     p.add_argument("--only", default=None,
@@ -197,12 +215,15 @@ def main() -> int:
             print(f"unknown decode preset {d!r}", file=sys.stderr)
             return 1
 
+    run_dir = args.run_dir or (Path("data/test")
+                               / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
     generate_fn, base = BACKENDS[args.framework](args)
     written = eval_io.run_test_set(
         generate_fn, adapter_id=args.adapter_id, framework=args.framework,
-        base_model=base, granularity=args.granularity, test_dir=args.test_dir,
+        base_model=base, granularity=args.granularity,
+        examples_dir=args.examples_dir, run_dir=run_dir,
         decodes=decodes, only=args.only, overwrite=args.overwrite)
-    print(f"\nwrote {len(written)} summary file(s)", file=sys.stderr)
+    print(f"\nwrote {len(written)} summary file(s) under {run_dir}", file=sys.stderr)
     return 0
 
 

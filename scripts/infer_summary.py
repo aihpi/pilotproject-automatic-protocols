@@ -161,8 +161,9 @@ def main() -> int:
                    help="4 = load base in NF4, 16 = bf16 (default: 4)")
     p.add_argument("--granularity", choices=("document", "per-top"), default="per-top",
                    help="Summarise per agenda item or whole document (default: per-top)")
-    p.add_argument("--max-new-tokens", type=int, default=4096,
-                   help="Max generated tokens per call (default: 4096)")
+    p.add_argument("--max-new-tokens", type=int, default=6144,
+                   help="Max generated tokens per call (default: 6144 — above the longest "
+                        "per-TOP training target, 4761, so a long section isn't clipped)")
     p.add_argument("--max-seq-len", type=int, default=65536,
                    help="Max prompt length before truncation. Default: 65536 (65k, matching "
                         "the training cap). Pass 0 for the model's full context window "

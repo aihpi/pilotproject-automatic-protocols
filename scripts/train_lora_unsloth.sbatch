@@ -32,6 +32,9 @@ BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 32768)
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
+# Which Unsloth trainer to run: the bespoke one (default) or the Kaggle-faithful v2.
+# v2's --epochs default is 1; pass EPOCHS explicitly to override either way.
+SCRIPT="${SCRIPT:-scripts/train_lora_unsloth.py}"
 
 export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocols/hf-cache}"
@@ -57,7 +60,8 @@ out_arg=()
 bit_arg=()
 [ "${NO4BIT:-0}" = "1" ] && bit_arg=(--no-4bit)
 
-"$VENV/bin/python" scripts/train_lora_unsloth.py \
+echo "[$(date -Is)] SCRIPT=$SCRIPT VENV=$VENV TRAIN=$TRAIN_JSONL MAXSEQ=$MAX_SEQ_LEN EPOCHS=$EPOCHS"
+"$VENV/bin/python" "$SCRIPT" \
     --train-jsonl "$TRAIN_JSONL" \
     "${val_arg[@]}" \
     --base-model  "$BASE_MODEL" \
