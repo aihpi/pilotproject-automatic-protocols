@@ -25,7 +25,7 @@ set +a
 OUT_DIR="${OUT_DIR:-results/summaries}"
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 ADAPTER="${ADAPTER:-results/lora_adapter}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"        # empty = auto (model context window)
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k default; set 0 for full context window
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"  # empty = script default (4096)
 
 export PATH="$HOME/.local/bin:$PATH"

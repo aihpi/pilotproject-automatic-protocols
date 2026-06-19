@@ -43,8 +43,9 @@ def parse_args() -> argparse.Namespace:
                         "for 4-bit smoke runs. Pass a path to override.")
     p.add_argument("--bits", type=int, choices=(4, 16), default=16,
                    help="16 = bf16 LoRA (default, real runs), 4 = QLoRA NF4 (smoke test)")
-    p.add_argument("--max-seq-len", type=int, default=None,
-                   help="Max packed sequence length in tokens. Default: the base model's "
+    p.add_argument("--max-seq-len", type=int, default=65536,
+                   help="Max sequence length in tokens. Default: 65536 (65k cap, matching "
+                        "build_dataset's default). Pass 0 to use the base model's full "
                         "context window (auto-detected, e.g. gemma-4-31B-it = 262144).")
     p.add_argument("--lora-r", type=int, default=16, help="LoRA rank (default: 16)")
     p.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha (default: 32)")
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
                         "needs the cut-cross-entropy package. See scripts/gemma4_cce_patch.py.")
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a checkpoint directory")
-    p.add_argument("--early-stopping-patience", type=int, default=2,
+    p.add_argument("--early-stopping-patience", type=int, default=3,
                    help="Stop after N evals without eval_loss improvement and keep the best "
                         "model (default: 2; only active with a validation set)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
@@ -173,9 +174,93 @@ def _git_commit() -> str:
         return "unknown"
 
 
+# gemma-4 uses `<|turn>role … <turn|>` markers and renders the system message as
+# its own turn. Its stock chat template has no `{% generation %}` block, which
+# SFTConfig(assistant_only_loss=True) needs to know which tokens are the response.
+# This template renders BYTE-IDENTICAL text to the stock one (asserted at runtime)
+# but wraps the model turn in {% generation %} so loss falls on the assistant only.
+_GEMMA4_GEN_TEMPLATE = (
+    "{{ bos_token }}"
+    "{%- for message in messages -%}"
+    "{%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}"
+    "{{- '<|turn>' + role + '\n' -}}"
+    "{%- if role == 'model' -%}"
+    # literal "{% generation %}" markers (no whitespace-control dashes): TRL's
+    # get_training_chat_template() requires the exact substring to accept the template.
+    "{% generation %}{{- message['content'] | trim -}}{{- '<turn|>\n' -}}{% endgeneration %}"
+    "{%- else -%}{{- message['content'] | trim -}}{{- '<turn|>\n' -}}{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- endif -%}"
+)
+
+
+def enable_assistant_only_loss(tokenizer, sample_messages: list[dict]) -> None:
+    """Install a generation-tagged chat template so assistant_only_loss masks the
+    prompt and trains on the assistant turn only. Fails fast (raises) if the new
+    template doesn't render identically to the model's own — i.e. if the base model
+    isn't gemma-4-shaped — so a run can never silently train on a mismatched prompt
+    or an empty loss mask."""
+    original = tokenizer.chat_template
+    before = tokenizer.apply_chat_template(sample_messages, tokenize=False,
+                                           add_generation_prompt=False)
+    tokenizer.chat_template = _GEMMA4_GEN_TEMPLATE
+    after = tokenizer.apply_chat_template(sample_messages, tokenize=False,
+                                          add_generation_prompt=False)
+    if before != after:
+        tokenizer.chat_template = original
+        raise RuntimeError(
+            "assistant_only_loss: generation-tagged template does not match the "
+            "model's chat template (base model may not be gemma-4). Aborting to "
+            "avoid a train/inference prompt mismatch.")
+    out = tokenizer.apply_chat_template(sample_messages, tokenize=True,
+                                        return_assistant_tokens_mask=True, return_dict=True)
+    n = sum(out.get("assistant_masks") or [])
+    if n == 0:
+        tokenizer.chat_template = original
+        raise RuntimeError("assistant_only_loss: assistant mask is empty; aborting.")
+    print(f"assistant-only loss: generation-tagged template installed "
+          f"(render-identical; mask={n} tokens on the sample)", file=sys.stderr)
+
+
+def drop_overlong_records(split, tokenizer, max_len: int, name: str):
+    """Drop records whose full conversation tokenizes beyond ``max_len``.
+
+    With assistant_only_loss, truncating such a record can remove its entire
+    assistant turn, leaving zero unmasked tokens — which makes cut-cross-entropy's
+    backward divide by zero (``grad_scale = 1 / lse.numel()``). Dropping them (with
+    a logged count) is safe: a record whose target is truncated away can't train
+    the response anyway. Records that fit are unaffected."""
+    def fits(ex):
+        ids = tokenizer.apply_chat_template(ex["messages"], tokenize=True,
+                                            add_generation_prompt=False)
+        return len(ids) <= max_len
+    n0 = len(split)
+    split = split.filter(fits)
+    dropped = n0 - len(split)
+    if dropped:
+        print(f"{name}: dropped {dropped}/{n0} records longer than max_seq_len={max_len} "
+              f"(would truncate the assistant away → CCE zero-token crash)", file=sys.stderr)
+    if len(split) == 0:
+        raise RuntimeError(f"{name}: all records exceed max_seq_len={max_len}; nothing to train on")
+    return split
+
+
+def _prompt_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _prompt_section(system_prompt: str) -> str:
+    """Markdown block recording the exact system prompt (for train_log / README)."""
+    if not system_prompt:
+        return "\n## System prompt\n\n_(none found in training data)_\n"
+    return (f"\n## System prompt\n\nsha256: `{_prompt_sha(system_prompt)}`\n\n"
+            f"```\n{system_prompt}\n```\n")
+
+
 def write_train_log(log_path: Path, args: argparse.Namespace, *, out_dir: Path,
                     logging_dir: str, n_train: int, n_val: int, train_loss: float,
-                    best_metric, best_ckpt) -> None:
+                    best_metric, best_ckpt, system_prompt: str = "") -> None:
     """Write a Markdown log of the run parameters for later comparison."""
     eff_batch = args.batch_size * args.grad_accum
     rows = [
@@ -207,17 +292,20 @@ def write_train_log(log_path: Path, args: argparse.Namespace, *, out_dir: Path,
         ("final train loss", f"{train_loss:.4f}"),
         ("best eval_loss", f"{best_metric:.4f}" if best_metric is not None else "-"),
         ("best checkpoint", best_ckpt or "-"),
+        ("assistant-only loss", "True"),
+        ("system prompt (sha256)", _prompt_sha(system_prompt) if system_prompt else "-"),
     ]
     lines = [f"# Training run — {out_dir.name}", "",
              "| Parameter | Value |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in rows]
+    lines.append(_prompt_section(system_prompt))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote run log to {log_path}", file=sys.stderr)
 
 
 def write_run_readme(out_dir: Path, args: argparse.Namespace, *, n_train: int, n_val: int,
-                     train_loss: float, best_metric) -> None:
+                     train_loss: float, best_metric, system_prompt: str = "") -> None:
     """Write a human-readable ``README.md`` of the run's key settings into the adapter dir
     (overwrites PEFT's generic model-card README). Companion to the full ``train_log.md``."""
     bits = f"{args.bits}-bit ({'QLoRA NF4' if args.bits == 4 else 'bf16 LoRA'})"
@@ -239,13 +327,15 @@ def write_run_readme(out_dir: Path, args: argparse.Namespace, *, n_train: int, n
         f"| LoRA r / alpha / dropout | {args.lora_r} / {args.lora_alpha} / {args.lora_dropout} |",
         f"| epochs / effective batch | {args.epochs} / {eff} |",
         f"| learning rate | {args.lr} |",
+        f"| assistant-only loss | True |",
+        f"| system prompt (sha256) | {_prompt_sha(system_prompt) if system_prompt else '-'} |",
         f"| final train loss | {train_loss:.4f} |",
         f"| best eval_loss | {best} |",
         f"| date | {datetime.now().isoformat(timespec='seconds')} |",
         f"| SLURM job | {os.environ.get('SLURM_JOB_ID', '-')} |",
         "",
         "See `train_log.md` for the full parameter list.",
-        "",
+        _prompt_section(system_prompt),
     ]
     (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"wrote README to {out_dir / 'README.md'}", file=sys.stderr)
@@ -258,7 +348,7 @@ def main() -> int:
         print(f"{args.train_jsonl} not found", file=sys.stderr)
         return 1
 
-    if args.max_seq_len is None:
+    if not args.max_seq_len:  # None or 0 -> fall back to the model's full context window
         args.max_seq_len = context_window(args.base_model)
     out_dir, log_path = resolve_output(args)
     args.out_dir = out_dir
@@ -300,6 +390,21 @@ def main() -> int:
 
     model, tokenizer = build_model_and_tokenizer(args)
 
+    # Record the exact system prompt baked into the training data (for log/README),
+    # and install the generation-tagged template so assistant_only_loss works.
+    sample_messages = dataset["train"][0]["messages"]
+    system_prompt = next((m["content"] for m in sample_messages
+                          if m["role"] == "system"), "")
+    enable_assistant_only_loss(tokenizer, sample_messages)
+
+    # Guard the assistant_only_loss + CCE zero-token crash: drop records whose
+    # conversation would be truncated past its assistant turn at this max_seq_len.
+    dataset["train"] = drop_overlong_records(dataset["train"], tokenizer,
+                                             args.max_seq_len, "train")
+    if "validation" in dataset:
+        dataset["validation"] = drop_overlong_records(dataset["validation"], tokenizer,
+                                                       args.max_seq_len, "val")
+
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -331,6 +436,9 @@ def main() -> int:
         optim="paged_adamw_8bit",
         max_length=args.max_seq_len,
         packing=args.packing,
+        # Train on the assistant turn only (mask system+user). Relies on the
+        # generation-tagged template installed by enable_assistant_only_loss().
+        assistant_only_loss=True,
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
@@ -378,10 +486,12 @@ def main() -> int:
             n_train=len(dataset["train"]), n_val=n_val,
             train_loss=result.training_loss,
             best_metric=trainer.state.best_metric,
-            best_ckpt=trainer.state.best_model_checkpoint)
+            best_ckpt=trainer.state.best_model_checkpoint,
+            system_prompt=system_prompt)
     # Human-readable run summary (replaces PEFT's generic model-card README.md).
     write_run_readme(out_dir, args, n_train=len(dataset["train"]), n_val=n_val,
-                     train_loss=result.training_loss, best_metric=trainer.state.best_metric)
+                     train_loss=result.training_loss, best_metric=trainer.state.best_metric,
+                     system_prompt=system_prompt)
     return 0
 
 

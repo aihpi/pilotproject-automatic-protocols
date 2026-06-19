@@ -43,22 +43,38 @@ def resolve_out_dir(out_dir: Path | None) -> Path:
     return Path("results") / datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def write_run_log(out_dir: Path, framework: str, rows: list[tuple[str, object]]) -> None:
+def _prompt_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _prompt_section(system_prompt: str) -> str:
+    if not system_prompt:
+        return "\n## System prompt\n\n_(none found in training data)_\n"
+    return (f"\n## System prompt\n\nsha256: `{_prompt_sha(system_prompt)}`\n\n"
+            f"```\n{system_prompt}\n```\n")
+
+
+def write_run_log(out_dir: Path, framework: str, rows: list[tuple[str, object]],
+                  system_prompt: str = "") -> None:
     """Write ``out_dir/train_log.md`` (same shape as the main pipeline's log)."""
     base = [
         ("framework", framework),
         ("date", datetime.now().isoformat(timespec="seconds")),
         ("SLURM job", os.environ.get("SLURM_JOB_ID", "-")),
     ]
+    extra = [("system prompt (sha256)", _prompt_sha(system_prompt) if system_prompt else "-")]
     lines = [f"# Training run — {out_dir.name}", "",
              "| Parameter | Value |", "|---|---|"]
-    lines += [f"| {k} | {v} |" for k, v in base + rows]
+    lines += [f"| {k} | {v} |" for k, v in base + rows + extra]
+    lines.append(_prompt_section(system_prompt))
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "train_log.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_run_readme(out_dir: Path, framework: str, base_model: str,
-                     summary: str, rows: list[tuple[str, object]]) -> None:
+                     summary: str, rows: list[tuple[str, object]],
+                     system_prompt: str = "") -> None:
     """Write a human-readable ``README.md`` into the run dir, mirroring
     ``scripts/train_lora.py::write_run_readme`` (overwrites PEFT's generic
     model-card README). Companion to the full ``train_log.md``."""
@@ -74,11 +90,12 @@ def write_run_readme(out_dir: Path, framework: str, base_model: str,
     ]
     lines += [f"| {k} | {v} |" for k, v in rows]
     lines += [
+        f"| system prompt (sha256) | {_prompt_sha(system_prompt) if system_prompt else '-'} |",
         f"| date | {datetime.now().isoformat(timespec='seconds')} |",
         f"| SLURM job | {os.environ.get('SLURM_JOB_ID', '-')} |",
         "",
         "See `train_log.md` for the full parameter list.",
-        "",
+        _prompt_section(system_prompt),
     ]
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")

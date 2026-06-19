@@ -27,7 +27,7 @@ set +a
 VAL_JSONL="${VAL_JSONL:-data/train/val.jsonl}"
 OUT_DIR="${OUT_DIR:-}"             # empty = auto-name (results/YYYYMMDD-HHMMSS; 4-bit smoke -> smoke_lora)
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"     # empty = auto (model context window)
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap default; set 0 for full context window
 BITS="${BITS:-16}"                 # 16 = real bf16 LoRA; smoke test: BITS=4 MAX_STEPS=5
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"   # set e.g. 5 for a quick smoke test

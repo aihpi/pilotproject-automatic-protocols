@@ -23,15 +23,18 @@ set -a
 [ -f .env ] && . ./.env
 set +a
 
-# Pinned comparison dataset (cap 32768). Smoke: BASE_MODEL=google/gemma-4-E2B-it
+# Default dataset = 65k cap. Smoke: BASE_MODEL=google/gemma-4-E2B-it
 # MAX_SEQ_LEN=4096 MAX_STEPS=20
-TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs/train.jsonl}"
-VAL_JSONL="${VAL_JSONL:-data/train_no_docs/val.jsonl}"
+TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs_cap65k/train.jsonl}"
+VAL_JSONL="${VAL_JSONL:-data/train_no_docs_cap65k/val.jsonl}"
 OUT_DIR="${OUT_DIR:-}"             # empty = script auto-names results/YYYYMMDD-HHMMSS
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-32768}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 32768)
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
+# Which Unsloth trainer to run: the bespoke one (default) or the Kaggle-faithful v2.
+# v2's --epochs default is 1; pass EPOCHS explicitly to override either way.
+SCRIPT="${SCRIPT:-scripts/train_lora_unsloth.py}"
 
 export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME="${HF_HOME:-/sc/projects/sci-aisc/pilotproject-automatic-protocols/hf-cache}"
@@ -57,7 +60,8 @@ out_arg=()
 bit_arg=()
 [ "${NO4BIT:-0}" = "1" ] && bit_arg=(--no-4bit)
 
-"$VENV/bin/python" scripts/train_lora_unsloth.py \
+echo "[$(date -Is)] SCRIPT=$SCRIPT VENV=$VENV TRAIN=$TRAIN_JSONL MAXSEQ=$MAX_SEQ_LEN EPOCHS=$EPOCHS"
+"$VENV/bin/python" "$SCRIPT" \
     --train-jsonl "$TRAIN_JSONL" \
     "${val_arg[@]}" \
     --base-model  "$BASE_MODEL" \

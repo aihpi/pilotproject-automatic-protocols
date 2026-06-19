@@ -22,24 +22,30 @@ import re
 import sys
 from pathlib import Path
 
-# Inlined from build_dataset.DEFAULT_SYSTEM_PROMPT (kept in sync) so this script
-# needs only the Unsloth venv (build_dataset pulls rapidfuzz/docling).
-DEFAULT_SYSTEM_PROMPT = (
-    "Du bist Protokollführer/in eines Ausschusses. "
-    "Wandle das wörtliche Sitzungstranskript in ein formelles "
-    "Ausschussprotokoll im amtlichen Stil um.\n\n"
-    "Sprache und Stil:\n"
-    "- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem Verwaltungsdeutsch.\n"
-    "- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten Person wieder.\n"
-    "- Nenne Sprecher/innen mit Name und Rolle/Fraktion.\n\n"
-    "Formatierung:\n"
-    "- Gliedere nach Tagesordnungspunkten mit Überschriften „## Zu TOP N:“.\n"
-    "- Formuliere Beschlüsse mit Abstimmungstripel (Ja : Nein : Enthaltungen).\n"
-    "- Trenne Beschlüsse/Festlegungen von der Zusammenfassung der Beratung.\n\n"
-    "Inhaltliche Treue:\n"
-    "- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde.\n"
-    "- Im Zweifel knapper und näher am Wortlaut bleiben."
-)
+# Inlined copy of build_dataset.DEFAULT_SYSTEM_PROMPT (the source of truth) so
+# this script needs only the Unsloth venv (build_dataset pulls rapidfuzz/docling).
+# Keep IN SYNC with scripts/build_dataset.py when the prompt changes.
+DEFAULT_SYSTEM_PROMPT = """Du bist Protokollführer/in eines Ausschusses. Wandle das wörtliche Sitzungstranskript in ein formelles Ausschussprotokoll im amtlichen Stil um.
+
+Sprache und Stil:
+- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem Verwaltungsdeutsch.
+- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten Person wieder (z. B. „Er betont, dass …“, „Sie verweist darauf, dass …“).
+- Nenne Sprecher/innen mit Name und Rolle/Fraktion, z. B. „Kristy Augustin (CDU)“, „Steffen Freiberg (Minister für Bildung, Jugend und Sport)“.
+
+Formatierung:
+- Gliedere nach Tagesordnungspunkten mit genau EINER Überschrift „## Zu TOP N:“ je Punkt (Nummer aus den <SD-TOP>-Markierungen).
+- Formuliere Beschlüsse als „Der [Gremium] beschließt einstimmig/mehrheitlich (Ja : Nein : Enthaltungen) …“ und gib Abstimmungsergebnisse stets als konkretes Tripel (Ja : Nein : Enthaltungen) bzw. als „einstimmig“/„mehrheitlich“ an — niemals als leeren Platzhalter.
+- Trenne, sofern vorhanden, Beschlüsse/Festlegungen von der Zusammenfassung der Beratung („Aus der Beratung“).
+
+Umgang mit dem Rohmaterial (Transkript):
+- Das Transkript ist eine automatische Verschriftlichung (ASR) mit Sprecher-Diarisierung; es enthält technische Markierungen und Erkennungsfehler, die NICHT ins Protokoll gehören.
+- Übernimm KEINE Zeitstempel (z. B. „[00:12:34]“ oder „(00:00:00.000 --> …)“) und erzeuge auch keine eigenen Zeit- oder „Sitzungsbeginn“-Angaben.
+- Entnimm die TOP-Nummer den <SD-TOP>-Markierungen, übernimm die Markierungen und Tags selbst (z. B. „<SD-SPK>“, „<SD-TOP>“, „SPEAKER_03“) aber nicht in den Text.
+- Ignoriere offensichtliche Transkriptionsfehler und sinnlose Wiederholungen (z. B. mehrfach hintereinander „Vielen Dank.“); wiederhole sie nicht und werte sie nicht als Inhalt.
+
+Inhaltliche Treue:
+- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde. Füge keine Inhalte, Wertungen oder Fakten hinzu, die nicht im Transkript stehen, und verändere oder verfälsche keine Aussagen (auch keine Namen oder Zahlen).
+- Im Zweifel knapper und näher am Wortlaut bleiben."""
 
 _FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 _TOP_TAG_RE = re.compile(r"<SD-TOP>(.*?)</SD>", re.DOTALL)
@@ -68,10 +74,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, default=Path("results/summaries_unsloth"))
     p.add_argument("--granularity", choices=("per-top", "document"), default="per-top",
                    help="per-top (default, matches training; short inputs avoid OOM) or document")
-    p.add_argument("--max-seq-len", type=int, default=32768)
-    p.add_argument("--max-new-tokens", type=int, default=4096)
+    p.add_argument("--max-seq-len", type=int, default=65536,
+                   help="Max prompt length before truncation (default: 65536, 65k)")
+    p.add_argument("--max-new-tokens", type=int, default=6144,
+                   help="Max generated tokens per call (default: 6144 — above the longest "
+                        "per-TOP training target, 4761)")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--repetition-penalty", type=float, default=1.0,
+                   help="1.0 = off; a gentle ~1.15 curbs echo loops (1.3 over-suppressed → salad)")
+    p.add_argument("--no-repeat-ngram-size", type=int, default=0,
+                   help="0 = off (recommended); small n-gram blocks cause character-salad")
+    p.add_argument("--min-new-tokens", type=int, default=0)
     return p.parse_args()
 
 
@@ -91,6 +105,12 @@ def main() -> int:
         load_in_4bit=True,
     )
     FastModel.for_inference(model)
+    # Stop on gemma-4's turn terminator "<turn|>" (id 106) as well as the base
+    # <eos>, else generation runs to max_new_tokens and the tail fills with
+    # repetition (handoff: late/missing EOS). ("<end_of_turn>" is not a gemma-4 token.)
+    _eot = tokenizer.convert_tokens_to_ids("<turn|>")
+    eos_ids = [i for i in (tokenizer.eos_token_id, _eot)
+               if isinstance(i, int) and i >= 0 and i != tokenizer.unk_token_id]
 
     if args.granularity == "per-top":
         segments = split_by_top(body)
@@ -107,7 +127,11 @@ def main() -> int:
         ).to(model.device)
         out = model.generate(
             input_ids=inputs, max_new_tokens=args.max_new_tokens,
+            min_new_tokens=args.min_new_tokens,
             temperature=args.temperature, top_p=args.top_p, do_sample=True,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            eos_token_id=eos_ids or None,
         )
         return tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True).strip()
 
