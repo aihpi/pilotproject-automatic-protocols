@@ -21,7 +21,7 @@ set -a
 [ -f .env ] && . ./.env
 set +a
 
-CONFIG="${CONFIG:-axolotl/gemma4_qlora.yml}"
+CONFIG="${CONFIG:-alternative_frameworks/axolotl/gemma4_qlora.yml}"
 NGPU="${NGPU:-4}"
 # Timestamped run folder (matches the YYYYMMDD-HHMMSS convention); override the
 # yaml's output_dir on the CLI. Axolotl writes its adapter + config there.

@@ -31,7 +31,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 16384); needs CCE=1 at this
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
 NGPU="${NGPU:-4}"
-# BACKEND=fsdp (configs/fsdp.yaml) or BACKEND=zero3 (DeepSpeed configs/zero3.json)
+# BACKEND=fsdp (alternative_frameworks/configs/fsdp.yaml) or BACKEND=zero3 (DeepSpeed alternative_frameworks/configs/zero3.json)
 BACKEND="${BACKEND:-fsdp}"
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -54,9 +54,9 @@ BASE_VENV="${BASE_VENV:-/sc/home/hanno.mueller/pilotproject-automatic-protocols/
 [ -x "$BASE_VENV/bin/accelerate" ] || { echo "missing accelerate in $BASE_VENV"; exit 1; }
 
 if [ "$BACKEND" = "zero3" ]; then
-  launch=(--use_deepspeed --deepspeed_config_file configs/zero3.json --num_processes "$NGPU")
+  launch=(--use_deepspeed --deepspeed_config_file alternative_frameworks/configs/zero3.json --num_processes "$NGPU")
 else
-  launch=(--config_file configs/fsdp.yaml --num_processes "$NGPU")
+  launch=(--config_file alternative_frameworks/configs/fsdp.yaml --num_processes "$NGPU")
 fi
 
 # CCE=1 -> cut-cross-entropy loss (required for cap 32768 / uncapped: FSDP shards
@@ -65,7 +65,7 @@ cce_arg=()
 [ "${CCE:-0}" = "1" ] && cce_arg=(--cce)
 
 "$BASE_VENV/bin/accelerate" launch "${launch[@]}" \
-    scripts/train_lora_fsdp.py \
+    alternative_frameworks/train_lora_fsdp.py \
     --train-jsonl "$TRAIN_JSONL" \
     "${val_arg[@]}" \
     --base-model  "$BASE_MODEL" \

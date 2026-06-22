@@ -4,7 +4,7 @@ This pipeline fine-tunes an instruction LLM to turn committee **transcripts** in
 
 Approx VRAM for the 31B (seq 4096, batch 1, gradient checkpointing, AdamW-8bit, LoRA r=16): **QLoRA 4-bit ≈ 24–28 GB** (base ≈ 16 GB); **16-bit LoRA ≈ 68–72 GB** (base ≈ 62 GB, fits one H100 tightly). Full fine-tuning would need ~500 GB.
 
-Gemma 4 is multimodal (text+vision+audio), but `AutoModelForCausalLM` loads the text path and training is text-only. Two Gemma-specific settings are baked into `train_lora.py`: attention defaults to **`sdpa`** (no flash-attn build needed), and `--exclude-modules` drops the **vision/audio towers** (their projections share the `q_proj`/`k_proj` names but use a wrapper layer PEFT can't adapt). Both are no-ops for plain text models, so the script stays general.
+Gemma 4 is multimodal (text+vision+audio), but `AutoModelForCausalLM` loads the text path and training is text-only. Two Gemma-specific settings are baked into the PEFT trainer `alternative_frameworks/train_lora_PEFT.py`: attention defaults to **`sdpa`** (no flash-attn build needed), and `--exclude-modules` drops the **vision/audio towers** (their projections share the `q_proj`/`k_proj` names but use a wrapper layer PEFT can't adapt). Both are no-ops for plain text models, so the script stays general.
 
 All paths below assume the corpus lives under **`data/`** (gitignored, a real working dir). The raw delivery is read-only shared storage, symlinked in as **`data/raw`**; stage **A0** stages it into the flat layout the rest of the pipeline expects. Stages run in order; each writes a new sub-folder so you can inspect intermediates.
 
@@ -37,7 +37,7 @@ The SLURM launchers and the stage-B scripts source `.env` automatically. `.env` 
 
 ## Running on SLURM (cluster specifics)
 
-The GPU sbatch scripts (`transcribe*.sbatch`, `train_lora.sbatch`) already set
+The GPU sbatch scripts (`transcribe*.sbatch`, `train_lora_unsloth.sbatch`) already set
 `--account=aisc --partition=aisc-batch`. You may use a different configuration on your cluster.
 
 CPU-only work (e.g. the optional `pdf_to_markdown.sbatch`) runs under the **`default`
@@ -161,7 +161,7 @@ The train/val split is **by session** (a session's items never straddle the spli
 ## D. Train the adapter (GPU / SLURM)
 
 ```bash
-TRAIN_JSONL=data/train/train.jsonl sbatch scripts/train_lora.sbatch
+TRAIN_JSONL=data/train/train.jsonl sbatch scripts/train_lora_unsloth.sbatch
 ```
 
 | Variable      | Default                              |
@@ -181,7 +181,7 @@ The sbatch also sets `#SBATCH --qos=aisc` (faster AISC queueing), `PYTORCH_CUDA_
 
 Scale up to the 31B with `BASE_MODEL=google/gemma-4-31B-it`. `HF_HOME` defaults to shared project storage to keep downloads off the home quota.
 
-Key `train_lora.py` flags: `--bits {4,16}`, `--cce`, `--lora-r/--lora-alpha/--lora-dropout`, `--target-modules`/`--exclude-modules`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--packing`, `--attn {sdpa,flash_attention_2,eager}`.
+Key PEFT (`alternative_frameworks/train_lora_PEFT.py`) flags: `--bits {4,16}`, `--cce`, `--lora-r/--lora-alpha/--lora-dropout`, `--target-modules`/`--exclude-modules`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--packing`, `--attn {sdpa,flash_attention_2,eager}`. The canonical Unsloth trainer (`scripts/train_lora_unsloth.py`) takes `--lora-r/--lora-alpha/--lora-dropout`, `--epochs`, `--max-steps`, `--lr`, `--batch-size`/`--grad-accum`, `--max-seq-len`, `--early-stopping-patience` (no `--cce`/`--bits`/`--packing`).
 
 > **Watch the sequence length:** per-TOP records with timestamps can exceed `MAX_SEQ_LEN=4096` real tokens and get truncated (losing part of the target). Raise `--max-seq-len` (e.g. 8192) for long sessions.
 >

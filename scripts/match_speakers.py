@@ -55,7 +55,7 @@ TOP_TAG_RE = re.compile(r"<SD-TOP>.*?(\d+).*?</SD>")
 SELF_INTRO_RE = re.compile(
     r"(?i)(?:mein name ist|ich heiße|ich heisse|ich bin)\s+"
     r"([A-ZÄÖÜ][\wäöüß.\-']*(?:\s+(?:[A-ZÄÖÜ][\wäöüß.\-']*|von|van|de|der|zu))*)")
-MAX_UNRESOLVED_SENTENCES = 2  # exclude a TOP if an unresolved speaker exceeds this many sentences
+MAX_UNRESOLVED_SENTENCES = 12  # exclude a TOP if an unresolved speaker exceeds this many sentences
 _SENTENCE_RE = re.compile(r"[.!?]+")
 
 

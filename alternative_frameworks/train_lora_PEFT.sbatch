@@ -80,7 +80,7 @@ cce_arg=()
 lr_arg=()
 [ -n "${LR:-}" ] && lr_arg=(--lr "$LR")
 
-uv run python scripts/train_lora.py \
+uv run python alternative_frameworks/train_lora_PEFT.py \
     --train-jsonl  "$TRAIN_JSONL" \
     "${val_arg[@]}" \
     --base-model   "$BASE_MODEL" \

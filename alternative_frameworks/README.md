@@ -1,4 +1,16 @@
-# Alternative LoRA implementations (branch `fix/LoRA_alternative_implementations`)
+# Alternative LoRA implementations
+
+> **Reorganised 2026-06-22.** The **Unsloth** approach won and is now the project's
+> **canonical trainer** at `scripts/train_lora_unsloth.py` (launcher
+> `scripts/train_lora_unsloth.sbatch`) — it is the recipe formerly called
+> `train_lora_unsloth_v2.py`. Everything in *this* folder is the parked, non-canonical
+> set: the original PEFT trainer (`train_lora_PEFT.py`, was `scripts/train_lora.py`),
+> the **deprecated** original Unsloth recipe (`train_lora_unsloth_deprecated.py`), plus
+> FSDP, Keras and Axolotl. They are kept for reference and require SLURM/the HPI cluster.
+> Shared helpers (`alt_utils.py`, `model_utils.py`, the eval harness) stayed in `scripts/`;
+> the moved trainers add `scripts/` to `sys.path` to import them. Paths below are
+> repo-root-relative (run `sbatch` from the repo root). The historical notes below
+> predate the move.
 
 Fresh, framework-diverse LoRA training scripts to beat the gemma-4-31B long-context
 **OOM** (root cause: the `seq×vocab` logits tensor, vocab = 262144 — not the weights).
@@ -16,10 +28,10 @@ the folder name) — same convention as `scripts/train_lora.py`. Eval with `scri
 
 | # | Framework | Angle on the OOM | GPUs | Files |
 |---|---|---|---|---|
-| 1 | **Unsloth** | single-GPU, fused CE + flash-attn, never materialises full logits | 1×H100 | `scripts/train_lora_unsloth.py` + `.sbatch` |
-| 2 | **Keras + JAX** | different stack/autodiff → dodges the PyTorch CE NaN; ModelParallel to escalate | 1→N | `scripts/train_lora_keras.py` + `.sbatch` |
-| 3 | **FSDP / ZeRO-3** | shard weights/grads/optimizer; frees GPU 0 (no `device_map=auto`) | 2–4×H100 | `scripts/train_lora_fsdp.py`, `configs/fsdp.yaml`, `configs/zero3.json`, `.sbatch` |
-| 4 | **Axolotl** | config-only QLoRA+FSDP; context parallelism for the 162k records | 4×H100 | `axolotl/gemma4_qlora.yml` + `scripts/train_lora_axolotl.sbatch` |
+| 1 | **Unsloth** (deprecated recipe) | single-GPU, fused CE + flash-attn, never materialises full logits | 1×H100 | `alternative_frameworks/train_lora_unsloth_deprecated.py` (no maintained launcher; canonical recipe is `scripts/train_lora_unsloth.py`) |
+| 2 | **Keras + JAX** | different stack/autodiff → dodges the PyTorch CE NaN; ModelParallel to escalate | 1→N | `alternative_frameworks/train_lora_keras.{py,sbatch}` |
+| 3 | **FSDP / ZeRO-3** | shard weights/grads/optimizer; frees GPU 0 (no `device_map=auto`) | 2–4×H100 | `alternative_frameworks/train_lora_fsdp.py`, `alternative_frameworks/configs/fsdp.yaml`, `alternative_frameworks/configs/zero3.json`, `.sbatch` |
+| 4 | **Axolotl** | config-only QLoRA+FSDP; context parallelism for the 162k records | 4×H100 | `alternative_frameworks/axolotl/gemma4_qlora.yml` + `alternative_frameworks/train_lora_axolotl.sbatch` |
 
 ### Environment — standalone venvs (NOT uv extras)
 
@@ -45,20 +57,20 @@ starts in seconds (the `aisc-batch` queue can be ~2 days for HPI jobs). All sbat
 `--account=aisc --qos=aisc --partition=aisc-batch --constraint=ARCH:X86 --exclude=gx13v1`.
 
 ```bash
-# 1) Unsloth — smoke on small model, then 31B @ 32768
-BASE_MODEL=google/gemma-4-E2B-it MAX_SEQ_LEN=4096 MAX_STEPS=20 sbatch scripts/train_lora_unsloth.sbatch
-sbatch scripts/train_lora_unsloth.sbatch                                   # 31B, cap 32768
+# 1) Unsloth is now CANONICAL — use scripts/train_lora_unsloth.sbatch (see root README).
+#    The deprecated original recipe (alternative_frameworks/train_lora_unsloth_deprecated.py)
+#    has no maintained launcher.
 
 # 2) Keras+JAX — smoke on a small preset, then scale + MODEL_PARALLEL=1
-PRESET=gemma3_instruct_1b MAX_SEQ_LEN=4096 LIMIT=20 sbatch scripts/train_lora_keras.sbatch
+PRESET=gemma3_instruct_1b MAX_SEQ_LEN=4096 LIMIT=20 sbatch alternative_frameworks/train_lora_keras.sbatch
 
 # 3) FSDP (or ZeRO-3) — smoke 2 GPUs, then 4
-BASE_MODEL=google/gemma-4-E2B-it MAX_SEQ_LEN=4096 MAX_STEPS=20 NGPU=2 sbatch scripts/train_lora_fsdp.sbatch
-BACKEND=zero3 sbatch scripts/train_lora_fsdp.sbatch                         # DeepSpeed variant
+BASE_MODEL=google/gemma-4-E2B-it MAX_SEQ_LEN=4096 MAX_STEPS=20 NGPU=2 sbatch alternative_frameworks/train_lora_fsdp.sbatch
+BACKEND=zero3 sbatch alternative_frameworks/train_lora_fsdp.sbatch         # DeepSpeed variant
 
 # 4) Axolotl — smoke via CLI overrides, then full
-OVERRIDES="base_model=google/gemma-4-E2B-it sequence_len=4096 max_steps=20" sbatch scripts/train_lora_axolotl.sbatch
-sbatch scripts/train_lora_axolotl.sbatch
+OVERRIDES="base_model=google/gemma-4-E2B-it sequence_len=4096 max_steps=20" sbatch alternative_frameworks/train_lora_axolotl.sbatch
+sbatch alternative_frameworks/train_lora_axolotl.sbatch
 ```
 
 Offline-cache note: pass a **local snapshot path** as `BASE_MODEL` rather than the HF id —

@@ -15,7 +15,7 @@ builds an instruction dataset, trains a (Q)LoRA adapter, and generates protocol 
 | **A. Ingest** | `scripts/ingest_corpus.py`, `pdf_to_markdown.py`, `docx_to_markdown.py`, `transcribe.py` | stage the raw corpus; PDF/DOCX/audio → markdown |
 | **B. Prepare** | `tag_transcript_tops.py`, `match_speakers.py` | tag agenda-item (TOP) boundaries and resolve speaker names → `data/transcripts/md_prepared/` |
 | **C. Dataset** | `scripts/build_dataset.py` | pair transcripts↔protocols per TOP, write chat-format `train/val.jsonl` |
-| **D. Train** | `scripts/train_lora.py` (+ `train_lora.sbatch`) | (Q)LoRA fine-tune on SLURM; long-context via cut-cross-entropy (`--cce`) |
+| **D. Train** | `scripts/train_lora_unsloth.py` (+ `train_lora_unsloth.sbatch`) | canonical Unsloth (Q)LoRA fine-tune on SLURM, single H100; alternative stacks (PEFT/FSDP/Keras/Axolotl) live in `alternative_frameworks/` |
 | **E. Infer** | `scripts/infer_summary.py` (+ `infer_summary.sbatch`) | generate protocol summaries from new transcripts |
 
 ## Long-context training (the OOM fix)
@@ -29,10 +29,10 @@ honouring Gemma's logit softcap. See `scripts/gemma4_cce_patch.py`.
 ## Quick start
 
 ```bash
-# Train (SLURM) — long-context QLoRA on the 31B
-USE_CCE=1 BITS=4 MAX_SEQ_LEN=32768 BASE_MODEL=google/gemma-4-31B-it \
-  TRAIN_JSONL=data/train_no_docs/train.jsonl VAL_JSONL=data/train_no_docs/val.jsonl \
-  sbatch --qos=aisc --gres=gpu:h100:2 --constraint=ARCH:X86 scripts/train_lora.sbatch
+# Train (SLURM) — canonical Unsloth (Q)LoRA on the 31B, single H100
+BASE_MODEL=google/gemma-4-31B-it MAX_SEQ_LEN=65536 \
+  TRAIN_JSONL=data/train_no_docs_cap65k/train.jsonl VAL_JSONL=data/train_no_docs_cap65k/val.jsonl \
+  sbatch scripts/train_lora_unsloth.sbatch
 
 # Infer with a trained adapter
 INPUT=data/transcripts/md_prepared/example_Transkript.md \
@@ -51,22 +51,24 @@ Each training run writes a self-contained `results/YYYYMMDD-HHMMSS/` folder (ada
 
 ## gemma-4-31B LoRA — alternative training stacks (status & open problems)
 
-Branch `fix/LoRA_alternative_implementations` adds framework-diverse LoRA trainers to beat the
-gemma-4-31B long-context OOM (root cause: the `seq×vocab`=262144 logits tensor). Full comparison
-and run instructions: [`LORA_ALTERNATIVES.md`](LORA_ALTERNATIVES.md).
+Framework-diverse LoRA trainers built to beat the gemma-4-31B long-context OOM (root cause: the
+`seq×vocab`=262144 logits tensor). **Unsloth won and is now the canonical trainer**
+(`scripts/train_lora_unsloth.py`); the others are parked under `alternative_frameworks/`. Full
+comparison and run instructions: [`alternative_frameworks/README.md`](alternative_frameworks/README.md).
 
 ### Verified working (mergeable)
-- **Unsloth, single H100** — `scripts/train_lora_unsloth.{py,sbatch}`. gemma-4-31B 4-bit @ **32768**,
-  eval_loss **1.055** (≈ the CCE baseline ~0.98), no OOM. Reaches **65536** on one GPU (run confirmed
-  in progress). Fused CE + offload. *Caveat:* its adapter only loads through Unsloth
-  (`Gemma4ClippableLinear`) — inference via `scripts/infer_unsloth.py`, not stock PEFT.
-- **FSDP + cut-cross-entropy, 4×H100** — `scripts/train_lora_fsdp.{py,sbatch}`, `configs/fsdp.yaml`,
+- **Unsloth, single H100 — now canonical** — `scripts/train_lora_unsloth.py` (+ `train_lora_unsloth.sbatch`).
+  gemma-4-31B 4-bit @ **32768**+, no OOM, best eval_loss on the v2 recipe. Fused CE + offload.
+  *Caveat:* its adapter only loads through Unsloth (`Gemma4ClippableLinear`) — inference via
+  `scripts/infer_unsloth.py`, not stock PEFT. (The original recipe is parked as
+  `alternative_frameworks/train_lora_unsloth_deprecated.py`.)
+- **FSDP + cut-cross-entropy, 4×H100** — `alternative_frameworks/train_lora_fsdp.{py,sbatch}`, `alternative_frameworks/configs/fsdp.yaml`,
   `scripts/gemma4_cce_patch.py`. gemma-4-31B bf16 @ **32768**, no OOM. FSDP shards the weights;
   **CCE is required** for the logits term (FSDP alone OOMs at 32768), plus `CPATH` for the Triton
   kernel. Stock-PEFT adapter (loads with `infer_summary.py`).
 
 ### Not working / needs further investigation (kept on this branch)
-1. **Keras/JAX 31B model-parallel** — `scripts/train_lora_keras.{py,sbatch}`. The sharding *logic
+1. **Keras/JAX 31B model-parallel** — `alternative_frameworks/train_lora_keras.{py,sbatch}`. The sharding *logic
    works*: `Gemma4CausalLM.from_preset` (the auto `CausalLM` mis-picks a non-constructable
    `Gemma4AssistantCausalLM`) + a verified gemma-4 tensor-parallel `layout_map`; the model shards
    across GPUs and reaches `fit()`. **Blocker:** `jax.errors.JaxRuntimeError: NCCL ncclAllReduce …
@@ -76,7 +78,7 @@ and run instructions: [`LORA_ALTERNATIVES.md`](LORA_ALTERNATIVES.md).
    `NCCL_DEBUG=INFO` for the real failure; verify jaxlib/NCCL versions; try
    `jax.distributed.initialize()`, `NCCL_SHM_DISABLE/IB_DISABLE/NVLS_ENABLE`; isolate with a
    minimal 2-GPU JAX all-reduce. Full detail: `tmp/HANDOFF_keras_modelparallel.md`.
-2. **Axolotl** — `axolotl/gemma4_qlora.yml`, `scripts/train_lora_axolotl.sbatch`. Cleared 6
+2. **Axolotl** — `alternative_frameworks/axolotl/gemma4_qlora.yml`, `alternative_frameworks/train_lora_axolotl.sbatch`. Cleared 6
    issues (optimizer, torchvision, cu128 driver, `Gemma4TextDecoderLayer` wrap-class, eager-attn
    for head_dim>256, CCE) but hits a **persistent 32 GB transient OOM at E2B/4096/2-GPU** under
    both FSDP1 and FSDP2. **Probable reason:** a full-precision transient load neither FSDP version

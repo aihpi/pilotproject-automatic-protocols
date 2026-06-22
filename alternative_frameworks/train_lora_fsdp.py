@@ -73,6 +73,7 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))  # ponytail: shared helpers stayed in scripts/
     from alt_utils import resolve_out_dir, write_run_log, write_run_readme
     # Reuse the PEFT path's validated assistant-only-loss helpers so the FSDP adapter
     # is trained identically (mask system+user, train on the assistant turn only).

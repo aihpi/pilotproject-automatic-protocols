@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
-"""Minimal Unsloth (Q)LoRA fine-tune — alternative to scripts/train_lora.py.
+"""Kaggle-faithful Unsloth (Q)LoRA fine-tune for gemma-4-31B-it.
 
-Approach #1 of branch ``fix/LoRA_alternative_implementations``: attack the
-gemma-4 long-context OOM with **Unsloth** on a *single* GPU. Unsloth ships its
-own memory-efficient fused cross-entropy + flash-attention and patches the model
-so the seq×vocab logits tensor (the OOM root cause, gemma-4 vocab = 262144) is
-never fully materialised. This is the smallest possible setup; add complexity
-(lower cap, offloaded checkpointing, an ``unsloth/*-bnb-4bit`` repo) only if it
-fails.
+This is the project's CANONICAL trainer (formerly ``train_lora_unsloth_v2.py``).
+Mirrors Daniel Hanchen's `gemma4-31b-unsloth` Kaggle notebook as closely as our
+task allows, instead of the bespoke approach in the now-deprecated
+``alternative_frameworks/train_lora_unsloth_deprecated.py``:
 
-Reads the same chat-``messages`` JSONL produced by ``scripts/build_dataset.py``
-and writes an adapter + tokenizer for ``scripts/infer_summary.py``, so results
-are directly comparable to the other implementations.
+  * LoRA targeting via Unsloth's multimodal-safe ``finetune_*_layers`` flags
+    (language layers only) rather than an explicit ``target_modules`` list that
+    could also match the vision tower.
+  * ``get_chat_template(tokenizer, "gemma-4")`` (non-thinking — our protocol
+    targets carry no ``<|channel>thought`` reasoning trace) + standard
+    ``apply_chat_template`` so the system prompt is its own turn.
+  * ``standardize_data_formats`` + render to a ``"text"`` column, stripping the
+    leading ``<bos>`` (the collator re-adds exactly one).
+  * Notebook defaults: r=8/alpha=8, bs1/ga4, 1 epoch, lr 2e-4, adamw_8bit,
+    wd 0.001, linear schedule, warmup_steps 5.
+  * ``train_on_responses_only`` (assistant-turn loss).
 
-IMPORTANT: ``import unsloth`` must run before transformers/trl so its patches
-apply — keep that import at the very top.
+Our-task deviations (all exposed as CLI flags): the hardened system prompt baked
+into the data, ``--max-seq-len 65536`` + ``SFTConfig.max_length`` (else TRL
+truncates the long records), eval on a val split, tensorboard logging, and the
+same best-eval_loss checkpoint + early stopping as the PEFT trainer
+``alternative_frameworks/train_lora_PEFT.py`` (the notebook saves the last checkpoint).
+
+Run in the Unsloth venv (see scripts/train_lora_unsloth.sbatch). IMPORTANT:
+``import unsloth`` must precede transformers/trl so its patches apply.
 """
 from __future__ import annotations
 
@@ -30,31 +41,35 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--train-jsonl", required=True, type=Path)
     p.add_argument("--val-jsonl", type=Path, default=None)
-    p.add_argument("--base-model", default="google/gemma-4-E2B-it",
-                   help="HF id or local path (default: small model for smoke; scale to "
-                        "google/gemma-4-31B-it). Unsloth also accepts unsloth/* 4-bit repos.")
+    p.add_argument("--base-model", default="google/gemma-4-31B-it",
+                   help="HF id or local path (notebook uses unsloth/gemma-4-31B-it; we keep "
+                        "google/* to match the other v2 adapters' base). Unsloth accepts both.")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="Run folder. Default: auto-named results/YYYYMMDD-HHMMSS")
     p.add_argument("--max-seq-len", type=int, default=65536,
                    help="Max sequence length in tokens (default: 65536, 65k cap)")
     p.add_argument("--load-in-4bit", action="store_true", default=True,
-                   help="QLoRA 4-bit (default for single-GPU 31B). Use --no-4bit for bf16.")
+                   help="QLoRA 4-bit (notebook default). Use --no-4bit for 16-bit (bf16) LoRA.")
     p.add_argument("--no-4bit", dest="load_in_4bit", action="store_false")
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
-    p.add_argument("--lora-dropout", type=float, default=0.05)
-    p.add_argument("--target-modules",
-                   default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    p.add_argument("--epochs", type=float, default=3.0)
+    # LoRA — notebook values
+    p.add_argument("--lora-r", type=int, default=8)
+    p.add_argument("--lora-alpha", type=int, default=8)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--chat-template", default="gemma-4",
+                   help="Unsloth chat template (default gemma-4, non-thinking; notebook uses "
+                        "gemma-4-thinking — wrong for our non-reasoning targets)")
+    # Optimisation — notebook values
+    p.add_argument("--epochs", type=float, default=1.0,
+                   help="Notebook full-run value (1). Bump for more passes (early stopping guards).")
     p.add_argument("--max-steps", type=int, default=-1,
-                   help="-1 = use --epochs; set small (e.g. 20) for a smoke test")
+                   help="-1 = use --epochs; set small (e.g. 5) for a smoke test")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum", type=int, default=16)
-    p.add_argument("--warmup-ratio", type=float, default=0.03)
-    p.add_argument("--lr-scheduler", default="cosine")
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--warmup-steps", type=int, default=5)
+    p.add_argument("--lr-scheduler", default="linear")
+    p.add_argument("--weight-decay", type=float, default=0.001)
+    p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--early-stopping-patience", type=int, default=3,
                    help="Stop after N evals without eval_loss improvement; keep the best "
                         "checkpoint (needs a val set). 0 disables. Inert at epochs=1.")
@@ -71,6 +86,8 @@ def main() -> int:
     import torch
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
+    from unsloth.chat_templates import (get_chat_template, standardize_data_formats,
+                                        train_on_responses_only)
     from alt_utils import resolve_out_dir, write_run_log, write_run_readme
 
     args.out_dir = resolve_out_dir(args.out_dir)
@@ -79,20 +96,26 @@ def main() -> int:
           f"(4bit={args.load_in_4bit}, max_seq_len={args.max_seq_len})", file=sys.stderr, flush=True)
     model, tokenizer = FastModel.from_pretrained(
         model_name=args.base_model,
+        dtype=None,                       # auto
         max_seq_length=args.max_seq_len,
         load_in_4bit=args.load_in_4bit,
         full_finetuning=False,
     )
+    # Language-only LoRA via Unsloth's multimodal-safe flags (NOT an explicit module list).
     model = FastModel.get_peft_model(
         model,
+        finetune_vision_layers=False,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
-        target_modules=[m.strip() for m in args.target_modules.split(",") if m.strip()],
-        use_gradient_checkpointing="unsloth",  # Unsloth's offloaded checkpointing (long ctx)
         random_state=args.seed,
     )
+    # gemma-4 (non-thinking) chat template; same <|turn>user / <|turn>model markers.
+    tokenizer = get_chat_template(tokenizer, chat_template=args.chat_template)
 
     data_files = {"train": str(args.train_jsonl)}
     if args.val_jsonl and args.val_jsonl.exists():
@@ -105,24 +128,43 @@ def main() -> int:
     system_prompt = next((m["content"] for m in dataset["train"][0]["messages"]
                           if m["role"] == "system"), "")
 
+    # Normalise role/content, then render each conversation to a single 'text' string.
+    # removeprefix('<bos>'): the collator adds exactly one <bos> at tokenisation, so the
+    # template's leading <bos> must be stripped to avoid a double-bos (notebook detail).
+    # standardize_data_formats takes a Dataset (not a DatasetDict); apply per split. Our
+    # data is already OpenAI role/content, so this is largely a no-op / column rename.
+    for split in list(dataset.keys()):
+        try:
+            dataset[split] = standardize_data_formats(dataset[split])
+        except Exception as e:  # already normalised → fall back to raw messages
+            print(f"standardize_data_formats skipped for {split} ({e})", file=sys.stderr)
+
+    def formatting_prompts_func(examples):
+        convos = examples.get("conversations", examples.get("messages"))
+        return {"text": [tokenizer.apply_chat_template(
+            c, tokenize=False, add_generation_prompt=False).removeprefix("<bos>")
+            for c in convos]}
+
+    dataset = dataset.map(formatting_prompts_func, batched=True)
+
     sft_config = SFTConfig(
         output_dir=str(args.out_dir),
+        dataset_text_field="text",
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
-        # HF defaults eval batch to 8 -> OOMs at long ctx (handoff §2); pin to train batch.
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type=args.lr_scheduler,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
-        bf16=not args.load_in_4bit,  # 4-bit compute is bf16 internally; let Unsloth pick
-        max_length=args.max_seq_len,
+        bf16=not args.load_in_4bit,
+        max_length=args.max_seq_len,    # OURS: required, else TRL truncates the long records
         logging_steps=1,
         save_strategy="epoch",
         eval_strategy="epoch" if has_val else "no",
-        # keep the BEST eval_loss checkpoint (not the last/most-overfit), like train_lora.py
+        # OURS: keep the BEST eval_loss checkpoint (not the last/most-overfit), like train_lora.py
         load_best_model_at_end=has_val,
         metric_for_best_model="eval_loss" if has_val else None,
         greater_is_better=False if has_val else None,
@@ -133,55 +175,15 @@ def main() -> int:
         dataset_num_proc=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
 
-    # Unsloth's SFTTrainer wrapper doesn't auto-consume the chat 'messages' column,
-    # so render each conversation to a string via the tokenizer's chat template.
-    # (Minimal: loss over the whole string. Escalation: mask the prompt with a
-    # template carrying {% generation %} tags + assistant_only_loss=True.)
-    def to_convo(msgs):
-        # Gemma-4's chat template needs content as a list of typed parts and folds
-        # the system prompt into the user turn. Build a 2-turn user/model convo.
-        sys_txt = "".join(m["content"] for m in msgs if m["role"] == "system")
-        user_txt = "".join(m["content"] for m in msgs if m["role"] == "user")
-        model_txt = "".join(m["content"] for m in msgs if m["role"] == "assistant")
-        user_full = (sys_txt + "\n\n" + user_txt).strip() if sys_txt else user_txt
-        return [
-            {"role": "user", "content": [{"type": "text", "text": user_full}]},
-            {"role": "model", "content": [{"type": "text", "text": model_txt}]},
-        ]
-
-    def _render(convo):
-        return tokenizer.apply_chat_template(to_convo(convo), tokenize=False,
-                                             add_generation_prompt=False)
-
-    def formatting_func(ex):
-        # Unsloth probes with a single example (messages = one conversation: list
-        # of message dicts) and later maps with a batch (messages = list of
-        # conversations). Return a string for the former, a list for the latter.
-        m = ex["messages"]
-        # Always return a list of strings (Unsloth requires it). Single example:
-        # messages is one conversation (m[0] is a dict) -> wrap as a 1-element list.
-        if m and isinstance(m[0], dict):
-            return [_render(m)]
-        return [_render(c) for c in m]
-
     trainer = SFTTrainer(
         model=model,
-        args=sft_config,
+        processing_class=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("validation"),
-        processing_class=tokenizer,
-        formatting_func=formatting_func,
+        args=sft_config,
     )
 
-    # Assistant-only loss masking (the fix): without this the formatting_func string
-    # makes SFTTrainer compute loss over the WHOLE sequence (system+user+model), so
-    # the model learns to reproduce the transcript — the likely cause of the
-    # timestamp/echo degeneration and the implausibly low train loss (~0.12). This
-    # masks everything before each "<|turn>model\n" so loss is computed only on the
-    # assistant response (incl. its trailing "<turn|>" = EOS to learn).
-    from unsloth.chat_templates import train_on_responses_only
-    # gemma-4 turn markers are "<|turn>role" / "<turn|>" (NOT the gemma-2/3
-    # "<start_of_turn>"). Masking keys on the response marker, so it must match.
+    # Assistant-turn loss: mask everything up to and including "<|turn>model\n".
     trainer = train_on_responses_only(
         trainer,
         instruction_part="<|turn>user\n",
@@ -199,40 +201,35 @@ def main() -> int:
     best_eval_s = f"{best_eval:.4f}" if isinstance(best_eval, (int, float)) else "-"
     print(f"final train loss: {result.training_loss:.4f} | best eval_loss: {best_eval_s}",
           file=sys.stderr)
-    print("note: train loss reflects assistant-only tokens; the SAVED adapter is the best "
-          "eval_loss checkpoint (load_best_model_at_end), not necessarily the last.",
-          file=sys.stderr)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(args.out_dir))       # LoRA adapter
+    model.save_pretrained(str(args.out_dir))       # LoRA adapter (best, when loaded)
     tokenizer.save_pretrained(str(args.out_dir))
-    write_run_log(args.out_dir, "unsloth", [
+    bits = "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"
+    rows = [
         ("base model", args.base_model),
-        ("bits", "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"),
+        ("recipe", "kaggle gemma4-31b-unsloth (finetune_*_layers, gemma-4 template)"),
+        ("bits", bits),
+        ("chat template", args.chat_template),
         ("max seq len", args.max_seq_len),
         ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
         ("batch / grad-accum", f"{args.batch_size} / {args.grad_accum}"),
+        ("lr / scheduler / warmup", f"{args.lr} / {args.lr_scheduler} / {args.warmup_steps} steps"),
+        ("weight decay", args.weight_decay),
         ("epochs / max steps", f"{args.epochs} / {args.max_steps}"),
         ("train jsonl", str(args.train_jsonl)),
         ("assistant-only loss", "True (train_on_responses_only)"),
         ("early-stopping patience", args.early_stopping_patience if has_val else "n/a (no val)"),
         ("final train loss", f"{result.training_loss:.4f}"),
         ("best eval_loss", best_eval_s),
-    ], system_prompt=system_prompt)
-    bits = "4-bit QLoRA" if args.load_in_4bit else "bf16 LoRA"
+    ]
+    write_run_log(args.out_dir, "unsloth", rows, system_prompt=system_prompt)
     write_run_readme(args.out_dir, "unsloth", args.base_model,
-                     f"{bits}, single-GPU fused CE, max_seq_len {args.max_seq_len}.", [
-                         ("precision", bits),
-                         ("max seq len", args.max_seq_len),
-                         ("LoRA r / alpha / dropout", f"{args.lora_r} / {args.lora_alpha} / {args.lora_dropout}"),
-                         ("epochs / effective batch", f"{args.epochs} / {args.batch_size * args.grad_accum}"),
-                         ("learning rate", args.lr),
-                         ("assistant-only loss", "True (train_on_responses_only)"),
-                         ("final train loss", f"{result.training_loss:.4f}"),
-                         ("best eval_loss", best_eval_s),
-                     ], system_prompt=system_prompt)
+                     f"{bits}, Kaggle gemma-4 recipe (r{args.lora_r}/a{args.lora_alpha}, "
+                     f"gemma-4 template), max_seq_len {args.max_seq_len}.", rows,
+                     system_prompt=system_prompt)
     print(f"saved adapter to {args.out_dir}", file=sys.stderr)
-    _ = torch  # silence unused if branch skips bf16
+    _ = torch  # silence unused if the 4-bit branch skips bf16
     return 0
 
 

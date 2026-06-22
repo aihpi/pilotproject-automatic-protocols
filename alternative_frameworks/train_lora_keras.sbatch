@@ -52,7 +52,7 @@ out_arg=()
 VENV="${VENV:-.venv-keras}"
 [ -x "$VENV/bin/python" ] || { echo "missing $VENV (see comment above to build it)"; exit 1; }
 
-"$VENV/bin/python" scripts/train_lora_keras.py \
+"$VENV/bin/python" alternative_frameworks/train_lora_keras.py \
     --train-jsonl "$TRAIN_JSONL" \
     "${val_arg[@]}" \
     --preset      "$PRESET" \

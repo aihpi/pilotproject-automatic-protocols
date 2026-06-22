@@ -22,30 +22,11 @@ import re
 import sys
 from pathlib import Path
 
-# Inlined copy of build_dataset.DEFAULT_SYSTEM_PROMPT (the source of truth) so
-# this script needs only the Unsloth venv (build_dataset pulls rapidfuzz/docling).
-# Keep IN SYNC with scripts/build_dataset.py when the prompt changes.
-DEFAULT_SYSTEM_PROMPT = """Du bist Protokollführer/in eines Ausschusses. Wandle das wörtliche Sitzungstranskript in ein formelles Ausschussprotokoll im amtlichen Stil um.
+from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
 
-Sprache und Stil:
-- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem Verwaltungsdeutsch.
-- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten Person wieder (z. B. „Er betont, dass …“, „Sie verweist darauf, dass …“).
-- Nenne Sprecher/innen mit Name und Rolle/Fraktion, z. B. „Kristy Augustin (CDU)“, „Steffen Freiberg (Minister für Bildung, Jugend und Sport)“.
-
-Formatierung:
-- Gliedere nach Tagesordnungspunkten mit genau EINER Überschrift „## Zu TOP N:“ je Punkt (Nummer aus den <SD-TOP>-Markierungen).
-- Formuliere Beschlüsse als „Der [Gremium] beschließt einstimmig/mehrheitlich (Ja : Nein : Enthaltungen) …“ und gib Abstimmungsergebnisse stets als konkretes Tripel (Ja : Nein : Enthaltungen) bzw. als „einstimmig“/„mehrheitlich“ an — niemals als leeren Platzhalter.
-- Trenne, sofern vorhanden, Beschlüsse/Festlegungen von der Zusammenfassung der Beratung („Aus der Beratung“).
-
-Umgang mit dem Rohmaterial (Transkript):
-- Das Transkript ist eine automatische Verschriftlichung (ASR) mit Sprecher-Diarisierung; es enthält technische Markierungen und Erkennungsfehler, die NICHT ins Protokoll gehören.
-- Übernimm KEINE Zeitstempel (z. B. „[00:12:34]“ oder „(00:00:00.000 --> …)“) und erzeuge auch keine eigenen Zeit- oder „Sitzungsbeginn“-Angaben.
-- Entnimm die TOP-Nummer den <SD-TOP>-Markierungen, übernimm die Markierungen und Tags selbst (z. B. „<SD-SPK>“, „<SD-TOP>“, „SPEAKER_03“) aber nicht in den Text.
-- Ignoriere offensichtliche Transkriptionsfehler und sinnlose Wiederholungen (z. B. mehrfach hintereinander „Vielen Dank.“); wiederhole sie nicht und werte sie nicht als Inhalt.
-
-Inhaltliche Treue:
-- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde. Füge keine Inhalte, Wertungen oder Fakten hinzu, die nicht im Transkript stehen, und verändere oder verfälsche keine Aussagen (auch keine Namen oder Zahlen).
-- Im Zweifel knapper und näher am Wortlaut bleiben."""
+# System prompt + input framing come from prompt_io (stdlib-only, importable in
+# the Unsloth venv). Single source of truth = prompt_summarize.txt.
+DEFAULT_SYSTEM_PROMPT = load_summary_prompt()
 
 _FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 _TOP_TAG_RE = re.compile(r"<SD-TOP>(.*?)</SD>", re.DOTALL)
@@ -117,9 +98,11 @@ def main() -> int:
     else:
         segments = [("", body)]
 
-    def generate(seg_text: str) -> str:
-        convo = [{"role": "user", "content": [{"type": "text",
-                  "text": (DEFAULT_SYSTEM_PROMPT + "\n\n" + seg_text).strip()}]}]
+    def generate(user_text: str) -> str:
+        convo = [
+            {"role": "system", "content": [{"type": "text", "text": DEFAULT_SYSTEM_PROMPT}]},
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
+        ]
         # truncate the prompt to the context budget (leave room for the completion)
         inputs = tokenizer.apply_chat_template(
             convo, tokenize=True, add_generation_prompt=True, return_tensors="pt",
@@ -138,7 +121,9 @@ def main() -> int:
     sections = []
     for label, seg in segments:
         print(f"generating {label or 'document'}", file=sys.stderr, flush=True)
-        gen = generate(seg)
+        # Same deployment-format input as training (prompt_io.build_user_message).
+        user = build_user_message(label or "Gesamtes Protokoll", render_transcript_text(seg))
+        gen = generate(user)
         sections.append(f"## Zu {label}:\n\n{gen}" if label else gen)
     result = "\n\n".join(sections)
 

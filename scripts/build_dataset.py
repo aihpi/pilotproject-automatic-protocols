@@ -34,6 +34,12 @@ from docx_to_markdown import convert_docx
 from model_utils import context_window
 from pdf_to_markdown import convert_pdf, make_converter
 from preprocess_protocol import clean_protocol, split_front_matter
+from prompt_io import (
+    build_user_message,
+    load_summary_prompt,
+    render_transcript_text,
+    top_title_from_protocol,
+)
 
 # Source of truth for the system prompt (training targets + inference). Inlined
 # copies in scripts/eval_io.py and scripts/infer_unsloth.py must be kept in sync.
@@ -283,7 +289,7 @@ def main() -> int:
             return 1
 
     system = (args.system_prompt_file.read_text(encoding="utf-8").strip()
-              if args.system_prompt_file else DEFAULT_SYSTEM_PROMPT)
+              if args.system_prompt_file else load_summary_prompt())
 
     transcripts = sorted(f for f in args.transcript_dir.iterdir()
                          if f.is_file() and f.suffix.lower() in (".docx", ".md"))
@@ -341,7 +347,9 @@ def main() -> int:
                 if approx_tokens(pr_tops[n]) < args.min_tgt_tokens:
                     dropped += 1
                     continue
-                consider(make_record(system, tx_tops[n], pr_tops[n],
+                user = build_user_message(top_title_from_protocol(protocol, n),
+                                          render_transcript_text(tx_tops[n]))
+                consider(make_record(system, user, pr_tops[n],
                                      {"stem": key, "top": n, "strategy": "per-top"}), n)
             if not common:  # no aligned TOPs located in this session
                 untagged.append(key)

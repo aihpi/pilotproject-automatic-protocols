@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate a smart summary (Protokoll) from a transcript with a fine-tuned LLM.
 
-Loads a base model (optionally 4-bit) plus a LoRA adapter from
-``scripts/train_lora.py`` and turns each input transcript into a protocol-style
+Loads a base model (optionally 4-bit) plus a LoRA adapter from any of the LoRA
+trainers (canonical ``scripts/train_lora_unsloth.py`` or the PEFT trainer in
+``alternative_frameworks/``) and turns each input transcript into a protocol-style
 Markdown summary. With ``--granularity per-top`` (default, matching training) the
 transcript is split on numbered ``<SD-TOP>`` markers, each agenda item is
 summarised separately and the sections are concatenated under ``Zu TOP N``
@@ -18,7 +19,8 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from build_dataset import DEFAULT_SYSTEM_PROMPT, split_transcript_by_top
+from build_dataset import split_transcript_by_top
+from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
 from model_utils import context_window
 from preprocess_protocol import split_front_matter
 
@@ -114,16 +116,20 @@ def generate(model, tokenizer, system: str, user: str, args: argparse.Namespace)
 
 def summarise(model, tokenizer, transcript: str, system: str, args: argparse.Namespace) -> str:
     if args.granularity == "document":
-        return generate(model, tokenizer, system, transcript, args)
+        return generate(model, tokenizer, system,
+                        build_user_message("Gesamtes Protokoll", render_transcript_text(transcript)), args)
 
     tops = split_transcript_by_top(transcript)
     if not tops:
         print("  no numbered TOPs found; falling back to whole-document", file=sys.stderr)
-        return generate(model, tokenizer, system, transcript, args)
+        return generate(model, tokenizer, system,
+                        build_user_message("Gesamtes Protokoll", render_transcript_text(transcript)), args)
 
     sections: list[str] = []
     for n in sorted(tops):
-        body = generate(model, tokenizer, system, tops[n], args)
+        # Same deployment-format input as training (prompt_io.build_user_message).
+        user = build_user_message(f"TOP {n}", render_transcript_text(tops[n]))
+        body = generate(model, tokenizer, system, user, args)
         sections.append(f"## Zu TOP {n}\n\n{body}")
     return "\n\n".join(sections)
 
@@ -196,7 +202,7 @@ def main() -> int:
     print(f"max-seq-len: {args.max_seq_len} tokens", file=sys.stderr)
 
     system = (args.system_prompt_file.read_text(encoding="utf-8").strip()
-              if args.system_prompt_file else DEFAULT_SYSTEM_PROMPT)
+              if args.system_prompt_file else load_summary_prompt())
 
     model, tokenizer = load_model(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)

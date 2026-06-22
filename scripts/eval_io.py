@@ -19,31 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+# Input contract lives in prompt_io (stdlib-only, so importable from the
+# alt-framework venvs too). Single source of truth for the prompt + the
+# deployment-format user message; no more inlined drift.
+from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
+
 # --- system prompt -----------------------------------------------------------
-# Inlined copy of build_dataset.DEFAULT_SYSTEM_PROMPT (the source of truth) —
-# build_dataset pulls rapidfuzz/docling and can't be imported from the alt venvs.
-# Keep IN SYNC with scripts/build_dataset.py when the prompt changes.
-DEFAULT_SYSTEM_PROMPT = """Du bist Protokollführer/in eines Ausschusses. Wandle das wörtliche Sitzungstranskript in ein formelles Ausschussprotokoll im amtlichen Stil um.
-
-Sprache und Stil:
-- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem Verwaltungsdeutsch.
-- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten Person wieder (z. B. „Er betont, dass …“, „Sie verweist darauf, dass …“).
-- Nenne Sprecher/innen mit Name und Rolle/Fraktion, z. B. „Kristy Augustin (CDU)“, „Steffen Freiberg (Minister für Bildung, Jugend und Sport)“.
-
-Formatierung:
-- Gliedere nach Tagesordnungspunkten mit genau EINER Überschrift „## Zu TOP N:“ je Punkt (Nummer aus den <SD-TOP>-Markierungen).
-- Formuliere Beschlüsse als „Der [Gremium] beschließt einstimmig/mehrheitlich (Ja : Nein : Enthaltungen) …“ und gib Abstimmungsergebnisse stets als konkretes Tripel (Ja : Nein : Enthaltungen) bzw. als „einstimmig“/„mehrheitlich“ an — niemals als leeren Platzhalter.
-- Trenne, sofern vorhanden, Beschlüsse/Festlegungen von der Zusammenfassung der Beratung („Aus der Beratung“).
-
-Umgang mit dem Rohmaterial (Transkript):
-- Das Transkript ist eine automatische Verschriftlichung (ASR) mit Sprecher-Diarisierung; es enthält technische Markierungen und Erkennungsfehler, die NICHT ins Protokoll gehören.
-- Übernimm KEINE Zeitstempel (z. B. „[00:12:34]“ oder „(00:00:00.000 --> …)“) und erzeuge auch keine eigenen Zeit- oder „Sitzungsbeginn“-Angaben.
-- Entnimm die TOP-Nummer den <SD-TOP>-Markierungen, übernimm die Markierungen und Tags selbst (z. B. „<SD-SPK>“, „<SD-TOP>“, „SPEAKER_03“) aber nicht in den Text.
-- Ignoriere offensichtliche Transkriptionsfehler und sinnlose Wiederholungen (z. B. mehrfach hintereinander „Vielen Dank.“); wiederhole sie nicht und werte sie nicht als Inhalt.
-
-Inhaltliche Treue:
-- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde. Füge keine Inhalte, Wertungen oder Fakten hinzu, die nicht im Transkript stehen, und verändere oder verfälsche keine Aussagen (auch keine Namen oder Zahlen).
-- Im Zweifel knapper und näher am Wortlaut bleiben."""
+DEFAULT_SYSTEM_PROMPT = load_summary_prompt()
 
 # --- transcript TOP splitting (inlined from build_dataset, 2-pass monotonic) --
 _FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
@@ -146,15 +128,18 @@ def summarise(transcript: str, granularity: str,
     """gen(user_text) -> model output. Per-top splits on <SD-TOP>; document does
     one pass. Falls back to whole-document when no numbered TOPs are present."""
     if granularity == "document":
-        return gen(transcript)
+        return gen(build_user_message("Gesamtes Protokoll", render_transcript_text(transcript)))
     tops = split_transcript_by_top(transcript)
     if not tops:
         log("  no numbered TOPs found; whole-document fallback")
-        return gen(transcript)
+        return gen(build_user_message("Gesamtes Protokoll", render_transcript_text(transcript)))
     sections = []
     for n in sorted(tops):
         log(f"  TOP {n} ({len(tops[n])} chars)")
-        sections.append(f"## Zu TOP {n}\n\n{gen(tops[n])}")
+        # Same deployment-format input as training (prompt_io.build_user_message);
+        # serve has no gold protocol, so the title is the "TOP {n}" fallback.
+        user = build_user_message(f"TOP {n}", render_transcript_text(tops[n]))
+        sections.append(f"## Zu TOP {n}\n\n{gen(user)}")
     return "\n\n".join(sections)
 
 

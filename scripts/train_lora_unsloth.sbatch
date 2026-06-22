@@ -32,8 +32,9 @@ BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 32768)
 EPOCHS="${EPOCHS:-3}"
 MAX_STEPS="${MAX_STEPS:--1}"
-# Which Unsloth trainer to run: the bespoke one (default) or the Kaggle-faithful v2.
-# v2's --epochs default is 1; pass EPOCHS explicitly to override either way.
+# Canonical Unsloth trainer (the Kaggle-faithful recipe, formerly train_lora_unsloth_v2.py).
+# Its own --epochs default is 1; this sbatch defaults EPOCHS=3 above (best-checkpoint +
+# early-stopping guard overfit). Override SCRIPT only to run a parked alternative.
 SCRIPT="${SCRIPT:-scripts/train_lora_unsloth.py}"
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -60,7 +61,20 @@ out_arg=()
 bit_arg=()
 [ "${NO4BIT:-0}" = "1" ] && bit_arg=(--no-4bit)
 
-echo "[$(date -Is)] SCRIPT=$SCRIPT VENV=$VENV TRAIN=$TRAIN_JSONL MAXSEQ=$MAX_SEQ_LEN EPOCHS=$EPOCHS"
+# Optional hyperparameter overrides for §2 sweeps. Omit -> the script's own defaults
+# (r8/alpha8/dropout0, lr 2e-4, bs1/ga4, warmup 5, wd 0.001, early-stop patience 3).
+sweep_args=()
+[ -n "${LORA_R:-}" ]       && sweep_args+=(--lora-r "$LORA_R")
+[ -n "${LORA_ALPHA:-}" ]   && sweep_args+=(--lora-alpha "$LORA_ALPHA")
+[ -n "${LORA_DROPOUT:-}" ] && sweep_args+=(--lora-dropout "$LORA_DROPOUT")
+[ -n "${LR:-}" ]           && sweep_args+=(--lr "$LR")
+[ -n "${BATCH_SIZE:-}" ]   && sweep_args+=(--batch-size "$BATCH_SIZE")
+[ -n "${GRAD_ACCUM:-}" ]   && sweep_args+=(--grad-accum "$GRAD_ACCUM")
+[ -n "${WARMUP_STEPS:-}" ] && sweep_args+=(--warmup-steps "$WARMUP_STEPS")
+[ -n "${WEIGHT_DECAY:-}" ] && sweep_args+=(--weight-decay "$WEIGHT_DECAY")
+[ -n "${ES_PATIENCE:-}" ]  && sweep_args+=(--early-stopping-patience "$ES_PATIENCE")
+
+echo "[$(date -Is)] SCRIPT=$SCRIPT VENV=$VENV TRAIN=$TRAIN_JSONL MAXSEQ=$MAX_SEQ_LEN EPOCHS=$EPOCHS ${sweep_args[*]}"
 "$VENV/bin/python" "$SCRIPT" \
     --train-jsonl "$TRAIN_JSONL" \
     "${val_arg[@]}" \
@@ -69,4 +83,5 @@ echo "[$(date -Is)] SCRIPT=$SCRIPT VENV=$VENV TRAIN=$TRAIN_JSONL MAXSEQ=$MAX_SEQ
     --max-seq-len "$MAX_SEQ_LEN" \
     "${bit_arg[@]}" \
     --epochs      "$EPOCHS" \
-    --max-steps   "$MAX_STEPS"
+    --max-steps   "$MAX_STEPS" \
+    "${sweep_args[@]}"

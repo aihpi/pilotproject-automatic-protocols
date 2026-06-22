@@ -37,7 +37,7 @@ def render_chat(tokenizer, messages: list[dict]) -> str:
 
 def resolve_out_dir(out_dir: Path | None) -> Path:
     """Return the run folder. Explicit --out-dir wins; otherwise auto-name
-    ``results/YYYYMMDD-HHMMSS`` (matching scripts/train_lora.py)."""
+    ``results/YYYYMMDD-HHMMSS`` (the project run-folder convention)."""
     if out_dir is not None:
         return out_dir
     return Path("results") / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -76,7 +76,7 @@ def write_run_readme(out_dir: Path, framework: str, base_model: str,
                      summary: str, rows: list[tuple[str, object]],
                      system_prompt: str = "") -> None:
     """Write a human-readable ``README.md`` into the run dir, mirroring
-    ``scripts/train_lora.py::write_run_readme`` (overwrites PEFT's generic
+    ``alternative_frameworks/train_lora_PEFT.py::write_run_readme`` (overwrites PEFT's generic
     model-card README). Companion to the full ``train_log.md``."""
     lines = [
         f"# LoRA adapter — {out_dir.name}",
