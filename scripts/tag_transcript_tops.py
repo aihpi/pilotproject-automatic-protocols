@@ -29,10 +29,10 @@ import re
 import sys
 from pathlib import Path
 
-import llm_utils
+from utils import llm_utils
 from build_dataset import normalise_stem, split_protocol_by_top
 from preprocess_protocol import clean_protocol, split_cover, split_front_matter
-from speaker_utils import SEG_LINE_RE, SPK_TAG_RE
+from utils.speaker_utils import SEG_LINE_RE, SPK_TAG_RE
 
 TOP_ANNOUNCE_RE = re.compile(r"(?i)\b(?:TOP|Tagesordnungspunkt)\s*(\d+)")
 # Transition verbs that mark a genuine "we now turn to item N" (vs. a preamble preview

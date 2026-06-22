@@ -20,8 +20,8 @@ from pathlib import Path
 from tqdm import tqdm
 
 from build_dataset import split_transcript_by_top
-from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
-from model_utils import context_window
+from utils.prompt_io import build_user_message, load_summary_prompt, render_transcript_text
+from utils.model_utils import context_window
 from preprocess_protocol import split_front_matter
 
 

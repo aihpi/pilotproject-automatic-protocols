@@ -88,7 +88,7 @@ def main() -> int:
     from trl import SFTConfig, SFTTrainer
     from unsloth.chat_templates import (get_chat_template, standardize_data_formats,
                                         train_on_responses_only)
-    from alt_utils import resolve_out_dir, write_run_log, write_run_readme
+    from utils.alt_utils import resolve_out_dir, write_run_log, write_run_readme
 
     args.out_dir = resolve_out_dir(args.out_dir)
 

@@ -22,7 +22,7 @@ from typing import Callable
 # Input contract lives in prompt_io (stdlib-only, so importable from the
 # alt-framework venvs too). Single source of truth for the prompt + the
 # deployment-format user message; no more inlined drift.
-from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
+from .prompt_io import build_user_message, load_summary_prompt, render_transcript_text
 
 # --- system prompt -----------------------------------------------------------
 DEFAULT_SYSTEM_PROMPT = load_summary_prompt()

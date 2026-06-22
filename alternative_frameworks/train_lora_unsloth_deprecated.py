@@ -72,7 +72,7 @@ def main() -> int:
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))  # ponytail: shared helpers stayed in scripts/
-    from alt_utils import resolve_out_dir, write_run_log, write_run_readme
+    from utils.alt_utils import resolve_out_dir, write_run_log, write_run_readme
 
     args.out_dir = resolve_out_dir(args.out_dir)
 

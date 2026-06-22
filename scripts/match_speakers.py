@@ -37,10 +37,10 @@ from pathlib import Path
 
 from rapidfuzz import fuzz
 
-import llm_utils
+from utils import llm_utils
 from build_dataset import normalise_stem, split_protocol_by_top
 from preprocess_protocol import clean_protocol, split_front_matter
-from speaker_utils import (
+from utils.speaker_utils import (
     CUE_TRIGGER_RE,
     DEFER_SIGNAL_RE,
     SEG_LINE_RE,

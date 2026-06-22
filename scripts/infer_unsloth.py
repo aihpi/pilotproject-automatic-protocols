@@ -22,7 +22,7 @@ import re
 import sys
 from pathlib import Path
 
-from prompt_io import build_user_message, load_summary_prompt, render_transcript_text
+from utils.prompt_io import build_user_message, load_summary_prompt, render_transcript_text
 
 # System prompt + input framing come from prompt_io (stdlib-only, importable in
 # the Unsloth venv). Single source of truth = prompt_summarize.txt.

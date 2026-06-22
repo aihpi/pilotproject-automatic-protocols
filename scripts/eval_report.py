@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import eval_io
+from utils import eval_io
 
 TEST_DIR = Path("data/test")               # run outputs: data/test/<YYYYMMDD-HHMMSS>/
 EXAMPLES_DIR = Path("test")                # tracked clean held-out inputs + gold

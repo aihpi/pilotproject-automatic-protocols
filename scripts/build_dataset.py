@@ -31,10 +31,10 @@ from rapidfuzz import fuzz
 from tqdm import tqdm
 
 from docx_to_markdown import convert_docx
-from model_utils import context_window
+from utils.model_utils import context_window
 from pdf_to_markdown import convert_pdf, make_converter
 from preprocess_protocol import clean_protocol, split_front_matter
-from prompt_io import (
+from utils.prompt_io import (
     build_user_message,
     load_summary_prompt,
     render_transcript_text,

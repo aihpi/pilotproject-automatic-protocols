@@ -7,10 +7,12 @@
 > set: the original PEFT trainer (`train_lora_PEFT.py`, was `scripts/train_lora.py`),
 > the **deprecated** original Unsloth recipe (`train_lora_unsloth_deprecated.py`), plus
 > FSDP, Keras and Axolotl. They are kept for reference and require SLURM/the HPI cluster.
-> Shared helpers (`alt_utils.py`, `model_utils.py`, the eval harness) stayed in `scripts/`;
-> the moved trainers add `scripts/` to `sys.path` to import them. Paths below are
-> repo-root-relative (run `sbatch` from the repo root). The historical notes below
-> predate the move.
+> Shared helpers (`alt_utils`, `model_utils`, the eval harness) now live in
+> `scripts/utils/`; the moved trainers add `scripts/` to `sys.path` and import them as
+> `from utils.… import …`. The cut-cross-entropy patch `gemma4_cce_patch.py` lives **here**
+> (used by the FSDP and PEFT trainers; the `cut-cross-entropy` package stays a base dep, as
+> FSDP reuses the base venv). Paths below are repo-root-relative (run `sbatch` from the repo
+> root). The historical notes below predate the move.
 
 Fresh, framework-diverse LoRA training scripts to beat the gemma-4-31B long-context
 **OOM** (root cause: the `seq×vocab` logits tensor, vocab = 262144 — not the weights).
@@ -47,7 +49,8 @@ cd <worktree>
 uv venv .venv-unsloth --python 3.12 && uv pip install --python .venv-unsloth unsloth trl peft datasets bitsandbytes tensorboard
 uv venv .venv-keras   --python 3.12 && uv pip install --python .venv-keras   keras keras-hub "jax[cuda12]"
 uv venv .venv-axolotl --python 3.12 && uv pip install --python .venv-axolotl axolotl
-# FSDP reuses the MAIN checkout's base .venv (transformers/peft/trl/accelerate) — no build.
+# FSDP reuses the MAIN checkout's base .venv (transformers/peft/trl/accelerate, incl.
+# cut-cross-entropy for the --cce path) — no build.
 ```
 
 ### How to run (smoke first, then target)
@@ -136,25 +139,53 @@ generated protocols against the CCE baseline; log eval_loss + peak VRAM + wall-c
 | Keras+JAX | smoke ✓ | 4096 (smoke) | bf16 | 1→N | — | gemma-4 loads (`Gemma4Backbone`); 31B needs ModelParallel layout_map; non-PEFT `.h5`. |
 | Axolotl | ✗ | — | 4-bit | 2–4 | — | persistent 32 GB OOM; deprioritized (wrapper over FSDP track). |
 
-### Caps: 32768 solved; 65536 in progress; 162k = future work
+## Status & open problems (root README consolidated here)
+
+The tables above summarise this; the per-item detail and next steps follow. Root cause of the
+OOM: the `seq×vocab`=262144 logits tensor — not the weights.
+
+### Verified working (mergeable)
+- **Unsloth, single H100 — now canonical** — `scripts/train_lora_unsloth.py`
+  (+ `scripts/train_lora_unsloth.sbatch`). gemma-4-31B 4-bit @ **32768**+, no OOM, best eval_loss
+  on the v2 recipe (eval_loss 1.289→1.098→1.055, adapter `results/20260617-182728/`). Fused CE +
+  offload. *Caveat:* its adapter only loads through Unsloth (`Gemma4ClippableLinear`) — inference
+  via `scripts/infer_unsloth.py`, not stock PEFT. (The original recipe is parked as
+  `train_lora_unsloth_deprecated.py`.)
+- **FSDP + cut-cross-entropy, 4×H100** — `train_lora_fsdp.{py,sbatch}`, `configs/fsdp.yaml`,
+  `gemma4_cce_patch.py`. gemma-4-31B bf16 @ **32768**, no OOM. FSDP shards the weights; **CCE is
+  required** for the logits term (FSDP alone OOMs at 32768), plus `CPATH` for the Triton kernel.
+  Stock-PEFT adapter (loads with `scripts/infer_summary.py`).
+
+### Caps: 32768 solved; 65536 reached; 162k = future work
 - **32768** — solved (Unsloth 1-GPU, FSDP+CCE 4-GPU, CCE baseline).
-- **65536** — Unsloth reaches it on 1 H100 (run in progress); FSDP+CCE needs 8 GPU (4 OOMs).
-- **Uncapped 162k** — **accepted as out of reach for now**. Both Unsloth (1 H100) and FSDP+CCE
-  (4–8 H100) OOM: CCE removes the `seq×vocab` logits term, but **attention/activation at 162k**
-  still blows up (gemma-4 head_dim>256 also blocks flash-attn). True 162k needs **sequence/
-  context parallelism** (Axolotl `context_parallel` / FSDP ring-attention) — future work, per
-  handoff §6 B. 65536 covers ~all real sessions.
+- **65536** — Unsloth reaches it on 1 H100; FSDP+CCE needs 8 GPU (4 OOMs). Practical max.
+- **Uncapped 162k** — OOMs on every stack (Unsloth 1-GPU; FSDP+CCE 4–8-GPU). CCE removes the
+  `seq×vocab` logits term, but **attention/activation at 162k** still blows up (gemma-4
+  `head_dim>256` also blocks flash-attn). True 162k needs **sequence/context parallelism**
+  (Axolotl `context_parallel_size` / FSDP ring-attention) — future work. 65536 covers ~all real sessions.
 
-### Keras 31B — model-parallel works, blocked on JAX/NCCL (parked)
-Sharding logic is done and **accepted** (model shards across GPUs, reaches `fit()`): use
-`Gemma4CausalLM.from_preset` (auto `CausalLM` mis-picks a broken Assistant class) + a verified
-gemma-4 tensor-parallel `layout_map`. Blocked on a cluster-level `ncclAllReduce` "invalid
-argument" during `fit` — a JAX-distributed/NCCL infra issue, not the sharding. Parked; full repro
-+ fix directions in `tmp/HANDOFF_keras_modelparallel.md`.
-
-### Protocol quality (held-out AIL_6 / AIK_8_1 / HA_8_4, per-top) — see `tmp/lora_cmp/`
-Degradation (raw-transcript echo + repetition) is **dominated by the inference script, not the
-adapter**: protocols via `infer_summary.py` (proper 2-pass `split_transcript_by_top`) are clean
-(CCE, FSDP: ~0 raw-timestamp leaks); via `infer_unsloth.py` (crude single-pass split, no
-repetition penalty) they degrade badly (100s of leaked lines). Fix tracked in
-`tmp/HANDOFF_repetition_fix.md` (separate branch).
+### Not working / needs further investigation
+1. **Keras/JAX 31B model-parallel** — `train_lora_keras.{py,sbatch}`. The sharding *logic works*:
+   `Gemma4CausalLM.from_preset` (the auto `CausalLM` mis-picks a non-constructable
+   `Gemma4AssistantCausalLM`) + a verified gemma-4 tensor-parallel `layout_map`; the model shards
+   across GPUs and reaches `fit()`. **Blocker:** `jax.errors.JaxRuntimeError: NCCL ncclAllReduce …
+   invalid argument` (`jit_greater`) during the first step — persists without the accuracy metric
+   and with `NCCL_P2P_DISABLE=1`. **Probable reason:** cluster-level JAX-distributed/NCCL mismatch
+   (jaxlib↔NCCL version, topology, XLA flags), not the sharding map. **Next steps:**
+   `NCCL_DEBUG=INFO` for the real failure; verify jaxlib/NCCL versions; try
+   `jax.distributed.initialize()`, `NCCL_SHM_DISABLE/IB_DISABLE/NVLS_ENABLE`; isolate with a
+   minimal 2-GPU JAX all-reduce. Full detail: `tmp/HANDOFF_keras_modelparallel.md`.
+2. **Axolotl** — `axolotl/gemma4_qlora.yml`, `train_lora_axolotl.sbatch`. Cleared 6 issues
+   (optimizer, torchvision, cu128 driver, `Gemma4TextDecoderLayer` wrap-class, eager-attn for
+   head_dim>256, CCE) but hits a **persistent 32 GB transient OOM at E2B/4096/2-GPU** under both
+   FSDP1 and FSDP2. **Probable reason:** a full-precision transient load neither FSDP version
+   shards. **Next steps:** DeepSpeed ZeRO-3 backend instead of FSDP; disable axolotl
+   preprocessing/packing; trace the 32 GB allocation. **Low priority** — it wraps the FSDP track
+   that already works.
+3. **Protocol repetition/echo at inference** — per-top summaries degrade from ~TOP 3 (echo raw
+   transcript + repetition) on held-out AIL_6 / AIK_8_1 / HA_8_4 (see `tmp/lora_cmp/`).
+   Degradation is **dominated by the inference script, not the adapter**: protocols via
+   `scripts/infer_summary.py` (proper 2-pass `split_transcript_by_top`) are clean (CCE, FSDP: ~0
+   raw-timestamp leaks); via `scripts/infer_unsloth.py` (crude single-pass `split_by_top`, no
+   `repetition_penalty`) they degrade badly (100s of leaked lines). **Next steps + evidence:**
+   `tmp/HANDOFF_repetition_fix.md` (separate branch).
