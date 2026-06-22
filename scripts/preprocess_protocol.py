@@ -37,6 +37,30 @@ _PAGE_TABLE_RE = re.compile(
     r"\|[-:\s|]+\|\n"
     r"\|[^\n]*\|[ \t]*\n?"
 )
+# Confirmation footer appended once the committee ratifies the protocol — not
+# inferable from the transcript, must never be a training target.
+_CONFIRM_FOOTER_RE = re.compile(
+    r"(?m)^[ \t]*\(Dieses\s+Protokoll\s+wurde\s+durch\b[^\n]*?§\s?83[^\n]*?best[äa]tigt\.\)[ \t]*$\n?")
+# Plain-text page footer (PDF→md conversion dropped the table pipes, so
+# _PAGE_TABLE_RE misses it): an optional committee-abbreviation line (e.g. "HA",
+# "ABJS", "P-ABJS"), the "N. (öffentliche/nichtöffentliche/Sonder-) Sitzung …"
+# line, and an optional trailing date line. Anchored on the unambiguous Sitzung
+# line so it never eats prose.
+_PLAIN_FOOTER_RE = re.compile(
+    r"(?m)"
+    r"(?:^[ \t]*#{0,6}[ \t]*[A-ZÄÖÜ][A-ZÄÖÜ0-9/-]{1,9}[ \t]*\n\s*)?"
+    r"^[ \t]*#{0,6}[ \t]*\d{1,3}\.\s*\((?:öffentliche|nichtöffentliche|Sonder-)[^\n]*Sitzung[^\n]*\n"
+    r"(?:[ \t]*\n)*"
+    r"(?:^[ \t]*#{0,6}[ \t]*\d{1,2}\.\d{1,2}\.\d{4}[ \t]*\n)?")
+# TOP heading mis-rendered as a list item ("- Zu TOP 8") → proper "## Zu TOP 8".
+_TOP_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*][ \t]*(Zu\s+TOP\b[^\n]*)$")
+# Committee-code page header/footer left as a standalone line ("HA", "## RA", "SBü",
+# "EK82", "P-ABJS") or dangling at the end of a wrapped prose line (a page break merged
+# it in). Shape: 2–6 uppercase letters + optional trailing "ü"/digits — excludes
+# Title-case words (e.g. "Der", "Aus"), which have only the first letter capitalised.
+_ABBR_CODE = r"(?:P-)?[A-ZÄÖÜ]{2,6}(?:ü|[0-9]{1,3})?"
+_STANDALONE_ABBR_RE = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}|[-*])?[ \t]*(" + _ABBR_CODE + r")\.?[ \t]*$\n?")
 _IMAGE_RE = re.compile(r"(?m)^[ \t]*<!-- image -->[ \t]*\n?")
 _HYPERLINK_RE = re.compile(r"\[([^\]]*)\]\((?:https?:|mailto:)[^)]*\)")
 # Footnote definition lines that reference an attachment (the lookahead keeps
@@ -100,6 +124,34 @@ def strip_page_tables(text: str) -> str:
     return _PAGE_TABLE_RE.sub("", text)
 
 
+def strip_plain_footers(text: str) -> str:
+    """Drop plain-text page footers the table regex misses (committee abbr +
+    'N. (…) Sitzung …' + optional date), wherever a page break left them."""
+    return _PLAIN_FOOTER_RE.sub("", text)
+
+
+def strip_confirmation_footer(text: str) -> str:
+    """Drop the post-ratification '(Dieses Protokoll wurde … § 83 … bestätigt.)'."""
+    return _CONFIRM_FOOTER_RE.sub("", text)
+
+
+def normalize_top_headings(text: str) -> str:
+    """Rewrite a TOP heading mis-rendered as a list item ('- Zu TOP 8') to '## Zu TOP 8'."""
+    return _TOP_BULLET_RE.sub(r"## \1", text)
+
+
+def strip_footer_abbrevs(text: str) -> str:
+    """Drop the committee-code page header/footer left as a standalone line, and the same
+    code dangling at the end of a wrapped prose line (a page break merged it in). Codes are
+    derived from the standalone occurrences in this document, so only its own footer code
+    is stripped from line ends."""
+    codes = set(_STANDALONE_ABBR_RE.findall(text))
+    text = _STANDALONE_ABBR_RE.sub("", text)
+    for c in sorted(codes, key=len, reverse=True):
+        text = re.sub(r"[ \t]+" + re.escape(c) + r"\.?[ \t]*$", "", text, flags=re.M)
+    return text
+
+
 def strip_images(text: str) -> str:
     return _IMAGE_RE.sub("", text)
 
@@ -135,6 +187,10 @@ def clean_protocol(text: str) -> tuple[str, str, bool]:
         return cover, "", False
     body = remove_attachments(body)
     body = strip_page_tables(body)
+    body = strip_plain_footers(body)
+    body = strip_confirmation_footer(body)
+    body = normalize_top_headings(body)
+    body = strip_footer_abbrevs(body)
     body = strip_images(body)
     body = strip_hyperlinks(body)
     body = strip_attachment_refs(body)
