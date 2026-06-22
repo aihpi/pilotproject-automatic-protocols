@@ -194,9 +194,10 @@ def main() -> int:
     p.add_argument("--max-seq-len", type=int, default=65536,
                    help="Prompt truncation budget (default: 65536, 65k); mirror the "
                         "adapter's training cap")
-    p.add_argument("--examples-dir", type=Path, default=Path("data/test/examples"),
+    p.add_argument("--examples-dir", type=Path, default=Path("test"),
                    help="Stable example inputs (one folder per example with "
-                        "*_Transkript.md + *_Protokoll.md)")
+                        "*_Transkript.md + *_Protokoll.md). Default: the tracked, clean "
+                        "held-out set test/ (old contaminated set: data/test/examples)")
     p.add_argument("--run-dir", type=Path, default=None,
                    help="Output folder for this eval run (default: data/test/<UTC ts>). "
                         "The eval matrix passes a shared timestamp so all adapters land "
