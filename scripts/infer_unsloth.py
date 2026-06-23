@@ -25,7 +25,7 @@ from pathlib import Path
 from utils.prompt_io import build_user_message, load_summary_prompt, render_transcript_text
 
 # System prompt + input framing come from prompt_io (stdlib-only, importable in
-# the Unsloth venv). Single source of truth = prompt_summarize.txt.
+# the Unsloth venv). Single source of truth = scripts/utils/prompt_summarize.txt.
 DEFAULT_SYSTEM_PROMPT = load_summary_prompt()
 
 _FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)

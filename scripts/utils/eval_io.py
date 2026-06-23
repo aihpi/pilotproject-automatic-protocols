@@ -139,7 +139,13 @@ def summarise(transcript: str, granularity: str,
         # Same deployment-format input as training (prompt_io.build_user_message);
         # serve has no gold protocol, so the title is the "TOP {n}" fallback.
         user = build_user_message(f"TOP {n}", render_transcript_text(tops[n]))
-        sections.append(f"## Zu TOP {n}\n\n{gen(user)}")
+        out = gen(user).strip()
+        # The model is trained to open with its own "## Zu TOP N:" heading; only add
+        # one when it didn't, so we never emit a doubled heading.
+        if re.match(r"(?i)^#{1,6}\s*zu\s+top\b", out):
+            sections.append(out)
+        else:
+            sections.append(f"## Zu TOP {n}\n\n{out}")
     return "\n\n".join(sections)
 
 

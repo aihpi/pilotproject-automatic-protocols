@@ -61,6 +61,8 @@ _TOP_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*][ \t]*(Zu\s+TOP\b[^\n]*)$")
 _ABBR_CODE = r"(?:P-)?[A-ZÄÖÜ]{2,6}(?:ü|[0-9]{1,3})?"
 _STANDALONE_ABBR_RE = re.compile(
     r"(?m)^[ \t]*(?:#{1,6}|[-*])?[ \t]*(" + _ABBR_CODE + r")\.?[ \t]*$\n?")
+# Empty heading lines ("##" with no text) left by PDF→md conversion / page breaks.
+_EMPTY_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]*$\n?")
 _IMAGE_RE = re.compile(r"(?m)^[ \t]*<!-- image -->[ \t]*\n?")
 _HYPERLINK_RE = re.compile(r"\[([^\]]*)\]\((?:https?:|mailto:)[^)]*\)")
 # Footnote definition lines that reference an attachment (the lookahead keeps
@@ -152,6 +154,11 @@ def strip_footer_abbrevs(text: str) -> str:
     return text
 
 
+def strip_empty_headings(text: str) -> str:
+    """Drop lines that are only a heading marker ('##' with no text)."""
+    return _EMPTY_HEADING_RE.sub("", text)
+
+
 def strip_images(text: str) -> str:
     return _IMAGE_RE.sub("", text)
 
@@ -194,6 +201,7 @@ def clean_protocol(text: str) -> tuple[str, str, bool]:
     body = strip_images(body)
     body = strip_hyperlinks(body)
     body = strip_attachment_refs(body)
+    body = strip_empty_headings(body)
     return cover, collapse_blanks(body), True
 
 

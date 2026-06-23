@@ -51,12 +51,12 @@ Shared helper modules used across the stages live in `scripts/utils/` (`prompt_i
 ```
 .
 ├── scripts/                  the pipeline: data prep, training, eval, inference
-│   └── utils/                shared helper modules (prompt/model/llm/speaker/eval/alt)
+│   └── utils/                shared helpers (prompt/model/llm/speaker/eval/alt)
+│       └── prompt_summarize.txt   summarisation system prompt (single source of truth)
 ├── alternative_frameworks/   parked non-canonical LoRA trainers (PEFT/FSDP/Keras/Axolotl) + README
 ├── 00_aisc/img/              logos / branding
 ├── data/                     gitignored working dir (corpus, intermediates, dataset)
 ├── results/                  trained adapters (results/YYYYMMDD-HHMMSS/)
-├── prompt_summarize.txt      summarisation system prompt (single source of truth)
 ├── pyproject.toml            base deps; alt-framework extras are a dependency record only
 ├── CHANGELOG.md
 └── README.md
@@ -116,8 +116,8 @@ data/protocols/pdf/      <stem>_Protokoll.pdf   A0 → symlinks to raw protocol 
 data/transcripts/audio/  <stem>_Transkript.mp3  A0 → symlinks to raw session MP3s (input)
 data/transcripts/manifest.txt            A0 → staged audio paths of trainable sessions
 data/ingest_report.tsv                   A0 → per-session stem/flags audit
-data/protocols/md/                       A → markdown protocols
-data/protocols/md_clean/   (+ cover/)    A → cleaned bodies + separated cover pages
+data/protocols/md/                       A → markdown protocols  ← protocol source (cleaned internally at build)
+data/protocols/md_clean/   (+ cover/)    A → OPTIONAL inspection output of preprocess_protocol.py (not a build input)
 data/transcripts/md/                     A → diarised transcripts (<SD-SPK>SPEAKER_NN, timestamps)
 data/transcripts/md_top/   (+ top_reports/)   B → transcripts with <SD-TOP> agenda tags
 data/transcripts/md_prepared/            B → speaker labels replaced with real names  ← dataset source
@@ -169,9 +169,11 @@ uv run python scripts/pdf_to_markdown.py --input data/protocols/pdf --out-dir da
 #    PDFs run it on a compute node instead (idempotent — skips already-converted files):
 #    INPUT=data/protocols/pdf OUT_DIR=data/protocols/md sbatch scripts/pdf_to_markdown.sbatch
 
-# 2) clean protocols: split off the cover (title/attendance/agenda) into md_clean/cover/,
-#    drop the Anlagen section, page-footer tables, <!-- image -->, hyperlinks and attachment
-#    footnotes. Verifies the cover boundary per file (OK/WARN/FAIL).
+# 2) OPTIONAL — materialise cleaned protocols for inspection: split off the cover
+#    (title/attendance/agenda) into md_clean/cover/, drop the Anlagen section, page-footer
+#    tables, <!-- image -->, hyperlinks and attachment footnotes. Verifies the cover boundary
+#    per file (OK/WARN/FAIL). build_dataset.py applies the same clean_protocol internally, so
+#    this step is not required to build the dataset.
 uv run python scripts/preprocess_protocol.py --input data/protocols/md --out-dir data/protocols/md_clean
 
 # 3) transcripts: audio → diarised markdown (Whisper + pyannote) with <SD-SPK>SPEAKER_NN tags

@@ -13,7 +13,7 @@ where ``transcript_text`` is clean ``Name: utterance`` lines (diarised, no
 timestamps, no ``<SD-*>`` markers). This module renders our tagged source
 transcripts into that exact shape.
 
-Run ``python scripts/prompt_io.py`` for the self-check.
+Run ``python scripts/utils/prompt_io.py`` for the self-check.
 """
 
 from __future__ import annotations
@@ -21,30 +21,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_PROMPT_FILE = Path(__file__).resolve().parents[1] / "prompt_summarize.txt"
-
-# Fallback if prompt_summarize.txt is missing. Keep in sync with that file; the
-# file is the source of truth (and the text to paste into the deployment's
-# prompt_gemma.txt).
-_FALLBACK_PROMPT = """Du bist Protokollführer/in eines Ausschusses. Wandle das wörtliche Transkript des folgenden Tagesordnungspunkts (TOP) in den entsprechenden Abschnitt eines formellen Ausschussprotokolls im amtlichen Stil um.
-
-Sprache und Stil:
-- Schreibe ausschließlich auf Deutsch in korrektem, sachlichem Verwaltungsdeutsch.
-- Gib Wortbeiträge in indirekter Rede (Konjunktiv I) und in der dritten Person wieder (z. B. „Er betont, dass …“, „Sie verweist darauf, dass …“).
-- Nenne Sprecher/innen mit Name und, wenn bekannt, Rolle/Fraktion, z. B. „Gustav Gans“, „Kristy Augustin (CDU)“, „Steffen Freiberg (Minister für Bildung, Jugend und Sport)“.
-
-Formatierung:
-- Beginne mit der Überschrift „## Zu TOP N:“ (N ist die Nummer aus der vorangestellten „TOP:“-Angabe).
-- Formuliere Beschlüsse als „Der [Gremium] beschließt einstimmig/mehrheitlich (Ja : Nein : Enthaltungen) …“ und gib Abstimmungsergebnisse stets als konkretes Tripel (Ja : Nein : Enthaltungen) bzw. als „einstimmig“/„mehrheitlich“ an — niemals als leeren Platzhalter.
-- Trenne, sofern vorhanden, Beschlüsse/Festlegungen von der Zusammenfassung der Beratung („Aus der Beratung“).
-
-Umgang mit dem Rohmaterial (Transkript):
-- Das Transkript ist eine automatische Verschriftlichung (ASR) mit Sprecher-Diarisierung; jede Zeile hat die Form „Name: Wortbeitrag“ und kann Erkennungsfehler enthalten, die NICHT ins Protokoll gehören.
-- Ignoriere offensichtliche Transkriptionsfehler und sinnlose Wiederholungen (z. B. mehrfach hintereinander „Vielen Dank.“); wiederhole sie nicht und werte sie nicht als Inhalt.
-
-Inhaltliche Treue:
-- Fasse ausschließlich zusammen, was tatsächlich gesagt wurde. Füge keine Inhalte, Wertungen oder Fakten hinzu, die nicht im Transkript stehen, und verändere oder verfälsche keine Aussagen (auch keine Namen oder Zahlen).
-- Im Zweifel knapper und näher am Wortlaut bleiben."""
+# Single source of truth for the system prompt: the file lives next to this module
+# (scripts/utils/prompt_summarize.txt). No hardcoded fallback — a missing file is a
+# loud error, not a silent drift from the deployment's locked prompt.
+_PROMPT_FILE = Path(__file__).resolve().parent / "prompt_summarize.txt"
 
 _SPK_RE = re.compile(r"<SD-SPK>(.*?)</SD>", re.DOTALL)
 _TOPTAG_RE = re.compile(r"<SD-TOP>.*?</SD>", re.DOTALL)
@@ -53,11 +33,19 @@ _TS_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*-->\s*\d{2}:\d{2}:\d{2}(?
 
 
 def load_summary_prompt() -> str:
-    """The summarization system prompt (prompt_summarize.txt, fallback constant)."""
+    """The summarization system prompt, read from ``scripts/utils/prompt_summarize.txt``.
+
+    Raises ``FileNotFoundError`` with a clear message if the file is missing — the
+    prompt is the single source of truth shared by training, evaluation and
+    inference, so silently substituting anything else would hide drift."""
     try:
         return _PROMPT_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return _FALLBACK_PROMPT
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"summary system prompt not found at {_PROMPT_FILE}: {exc}. "
+            "It is the single source of truth for training/eval/inference — "
+            "restore the file (do not substitute a fallback)."
+        ) from exc
 
 
 def render_transcript_text(segment: str) -> str:

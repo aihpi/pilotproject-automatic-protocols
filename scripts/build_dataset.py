@@ -67,7 +67,11 @@ Inhaltliche Treue:
 
 TOP_TAG_RE = re.compile(r"<SD-TOP>(.*?)</SD>", re.DOTALL)
 TOP_NUM_RE = re.compile(r"(?i)\b(?:TOP|Tagesordnungspunkt)\s*(\d+)")
-PROT_TOP_RE = re.compile(r"(?i)\bzu\s+TOP\s*(\d+)\b")
+# Anchor on the markdown heading ("## Zu TOP N"), NOT a bare "zu TOP N": matching
+# mid-line stripped each heading's "## " marker into the slice boundary (heading lost
+# its "##", and the next heading's "##" dangled as a trailing "##" on the previous
+# section). Anchoring keeps the "## " with its section and ignores prose back-references.
+PROT_TOP_RE = re.compile(r"(?im)^[ \t]*#{1,6}[ \t]*zu\s+TOP\s*(\d+)\b")
 # Committee protocols make two ascending passes over the TOPs: a terse decision
 # summary, then the substantive discussion. Split each pass on its own so the
 # numbering stays monotonic, then merge by TOP.
@@ -169,23 +173,81 @@ def _split_pass(text: str) -> dict[int, str]:
     return _monotonic_sections(boundaries, text)
 
 
+# A "## Zu TOP N[:]" heading line, capturing any inline title remainder.
+_TOP_HEAD_RE = re.compile(r"(?im)^#{1,6}[ \t]*Zu\s+TOP\s*(\d+)[ \t]*:?[ \t]*(.*)$")
+# Paragraph that begins the discussion (a speaker/role/report opener), so the
+# agenda title never swallows prose when it wraps across lines.
+_TITLE_STOP_RE = re.compile(
+    r"(?i)^(Der |Die |Das |Herr |Frau |Vorsitzend|Stellv|Bericht\b|Minister|"
+    r"Staatssekret|Abgeordnet|Er |Sie |Es |Auf |Zunächst|Eingangs|Im Anschluss|"
+    r"Einleitend|Anschließend)")
+
+
+def _heading_title_body(section: str) -> tuple[str, str]:
+    """Split one pass section into (title, body).
+
+    The section opens with a ``## Zu TOP N[:]`` heading; its inline remainder plus
+    any short wrapped continuation paragraphs (PDF line-breaks turned the agenda
+    title into several paragraphs) form the title, and the rest is the body. A
+    continuation paragraph joins the title only while it stays short, has no
+    sentence-ending punctuation and does not look like the start of the
+    discussion (``_TITLE_STOP_RE``)."""
+    s = section.lstrip("\n")
+    m = _TOP_HEAD_RE.match(s)
+    if not m:
+        return "", section.strip()
+    rest = s[m.end():].lstrip("\n")
+    title_parts = [m.group(2).strip()] if m.group(2).strip() else []
+    paras = re.split(r"\n\s*\n", rest)
+    body_start = 0
+    if title_parts:  # only extend an existing inline title
+        for i, p in enumerate(paras):
+            pp = p.strip()
+            if (i < 3 and pp and len(pp) <= 120 and not pp.startswith("#")
+                    and not re.search(r"[.!?]$", pp) and not _TITLE_STOP_RE.match(pp)):
+                title_parts.append(pp)
+                body_start = i + 1
+            else:
+                break
+    title = re.sub(r"\s+", " ", " ".join(title_parts)).strip(" :-–")
+    body = "\n\n".join(paras[body_start:]).strip()
+    return title, body
+
+
+def _canonical_top(n: int, beschluss_sec: str, beratung_sec: str) -> str:
+    """One canonical section per TOP: a single ``## Zu TOP N: <title>`` heading,
+    then the Beschluss, then an ``Aus der Beratung`` separator and the discussion.
+
+    Collapses the source's two-pass layout (a colon ``## Zu TOP N:`` Beschluss
+    heading plus a ``## Zu TOP N <title>`` Beratung heading) into one, so every
+    target shares the same shape regardless of whether the TOP carried a decision."""
+    b_title, b_body = _heading_title_body(beschluss_sec) if beschluss_sec.strip() else ("", "")
+    r_title, r_body = _heading_title_body(beratung_sec) if beratung_sec.strip() else ("", "")
+    title = r_title or b_title  # the Beratung pass carries the agenda title
+    parts = [f"## Zu TOP {n}: {title}".rstrip() if title else f"## Zu TOP {n}:"]
+    if b_body:
+        parts.append(b_body)
+    if r_body:
+        if b_body:
+            parts.append("Aus der Beratung")
+        parts.append(r_body)
+    return "\n\n".join(parts).strip()
+
+
 def split_protocol_by_top(text: str) -> dict[int, str]:
-    """Map TOP number -> decision summary + discussion for that agenda item.
+    """Map TOP number -> one canonical section (heading + Beschluss + discussion).
 
     Splits the ``Beschlüsse und Festlegungen`` and ``Aus der Beratung`` passes
-    independently (each monotonic on its own) and merges them per TOP. Falls back
-    to a single monotonic pass over the whole text when the section headings are
-    absent (e.g. non-standard layout)."""
+    independently (each monotonic on its own) and merges them per TOP via
+    ``_canonical_top``. Falls back to a single monotonic pass over the whole text
+    when the section headings are absent (e.g. non-standard layout)."""
     beschluss, beratung = _section_bounds(text)
     if not beschluss and not beratung:
-        return _split_pass(text)
+        return {n: _canonical_top(n, "", sec) for n, sec in _split_pass(text).items()}
     bm = _split_pass(beschluss)
     rm = _split_pass(beratung)
-    out: dict[int, str] = {}
-    for n in sorted(set(bm) | set(rm)):
-        out[n] = "\n\n".join(s for s in (bm.get(n, "").strip(),
-                                          rm.get(n, "").strip()) if s)
-    return out
+    return {n: _canonical_top(n, bm.get(n, ""), rm.get(n, ""))
+            for n in sorted(set(bm) | set(rm))}
 
 
 def make_record(system: str, user: str, assistant: str, meta: dict) -> dict:
@@ -233,8 +295,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--transcript-dir", type=Path, default=Path("data/transcripts/md"),
                    help="Directory of transcript files, .md/.docx (default: data/transcripts/md)")
-    p.add_argument("--protocol-dir", type=Path, default=Path("data/protocols/md_clean"),
-                   help="Directory of protocol files, .md/.pdf (default: data/protocols/md_clean)")
+    p.add_argument("--protocol-dir", type=Path, default=Path("data/protocols/md"),
+                   help="Directory of protocol files, .md/.pdf (default: data/protocols/md; "
+                        "protocols are cleaned internally, so the raw md/ dir is fine)")
     p.add_argument("--out-dir", type=Path, default=Path("data/train"),
                    help="Output directory for train.jsonl / val.jsonl (default: data/train)")
     p.add_argument("--granularity", choices=("document", "per-top"), default="per-top",
@@ -259,6 +322,11 @@ def main() -> int:
                    help="Max record length in real tokens; longer records are EXCLUDED (not "
                         "truncated) and recorded in --exclusions. Default: 65536 (65k cap). "
                         "Pass 0 to fall back to the base model's full context window.")
+    p.add_argument("--val-max-seq-len", type=int, default=8192,
+                   help="Cap on validation-record length in real tokens (default: 8192). A "
+                        "val-assigned record longer than this (but within --max-seq-len) is "
+                        "routed to train instead of dropped, keeping the eval forward pass cheap. "
+                        "Pass 0 to disable the cap (val keeps everything up to --max-seq-len).")
     p.add_argument("--system-prompt-file", type=Path, default=None,
                    help="File with a custom system prompt (default: built-in German prompt)")
     p.add_argument("--seed", type=int, default=42,
@@ -314,6 +382,9 @@ def main() -> int:
     excluded_n = 0
     untagged: list[str] = []  # sessions with no aligned TOPs (logged; included only on flag)
     failures: list[tuple[str, str]] = []
+    # per-TOP exclusion ledger for <out-dir>/exclusions_report.tsv:
+    # (stem, top, reason, seq_tokens, disposition)
+    exclusion_rows: list[tuple[str, str, str, str, str]] = []
     for tx_path, pr_path in tqdm(pairs, desc="build", unit="pair"):
         key = normalise_stem(tx_path.stem)
         try:
@@ -333,6 +404,9 @@ def main() -> int:
             rec["meta"]["seq_tokens"] = st
             if st > args.max_seq_len:
                 length_excluded.setdefault(key, set()).add(label)
+                exclusion_rows.append(
+                    (key, str(label), "length-excluded", str(st),
+                     f"excluded (> max_seq_len {args.max_seq_len})"))
             else:
                 recs.append(rec)
 
@@ -343,9 +417,15 @@ def main() -> int:
             for n in common:
                 if n in excluded.get(key, ()):  # unresolved speaker(s) -> drop
                     excluded_n += 1
+                    exclusion_rows.append(
+                        (key, str(n), "speaker-excluded", "",
+                         "excluded (unresolved speaker; --exclusions)"))
                     continue
                 if approx_tokens(pr_tops[n]) < args.min_tgt_tokens:
                     dropped += 1
+                    exclusion_rows.append(
+                        (key, str(n), "target-too-short", str(approx_tokens(pr_tops[n])),
+                         f"excluded (target < min_tgt_tokens {args.min_tgt_tokens})"))
                     continue
                 user = build_user_message(top_title_from_protocol(protocol, n),
                                           render_transcript_text(tx_tops[n]))
@@ -359,11 +439,16 @@ def main() -> int:
                           file=sys.stderr)
                     consider(make_record(system, transcript, protocol,
                                          {"stem": key, "strategy": "document-fallback"}), "document")
+                    exclusion_rows.append(
+                        (key, "*", "no-aligned-TOPs", "",
+                         "recovered as whole-document record (--include-untagged-as-document)"))
                 else:
                     why = ("excluded by default" if not args.include_untagged_as_document
                            else "skipped: target too short")
                     print(f"  no aligned TOPs for {tx_path.name}; {why} "
                           f"(logged to untagged_sessions.json)", file=sys.stderr)
+                    exclusion_rows.append(
+                        (key, "*", "no-aligned-TOPs", "", f"excluded ({why})"))
             elif not recs:  # had aligned TOPs but all excluded/short -> contribute nothing
                 print(f"  all aligned TOPs filtered for {tx_path.name}; skipped",
                       file=sys.stderr)
@@ -391,15 +476,31 @@ def main() -> int:
             print(f"{path} exists; use --overwrite", file=sys.stderr)
             return 1
 
-    n_train = n_val_recs = 0
+    # Validation length cap: a val-assigned record longer than --val-max-seq-len
+    # (but within --max-seq-len) is routed to TRAIN rather than dropped, keeping the
+    # eval forward pass cheap. This relaxes the by-session no-straddle invariant on
+    # purpose: a val session's long TOPs may land in train while its short TOPs stay
+    # in val (different TOPs/targets, so no target leakage).
+    val_cap = args.val_max_seq_len
+    n_train = n_val_recs = n_val_to_train = 0
     with train_path.open("w", encoding="utf-8") as ft, val_path.open("w", encoding="utf-8") as fv:
         for key in keys:
-            sink = fv if key in val_keys else ft
+            is_val = key in val_keys
             for rec in sessions[key]:
-                sink.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                if key in val_keys:
+                line = json.dumps(rec, ensure_ascii=False) + "\n"
+                if is_val and val_cap and rec["meta"]["seq_tokens"] > val_cap:
+                    ft.write(line)  # too long for val -> train
+                    n_train += 1
+                    n_val_to_train += 1
+                    exclusion_rows.append(
+                        (key, str(rec["meta"].get("top", "document")), "val-overflow",
+                         str(rec["meta"]["seq_tokens"]),
+                         f"moved to train (> val_max_seq_len {val_cap})"))
+                elif is_val:
+                    fv.write(line)
                     n_val_recs += 1
                 else:
+                    ft.write(line)
                     n_train += 1
 
     len_excluded_n = sum(len(v) for v in length_excluded.values())
@@ -411,6 +512,9 @@ def main() -> int:
     print(f"records:  {n_train} train, {n_val_recs} val "
           f"(dropped {dropped} short, {excluded_n} speaker-excluded, "
           f"{len_excluded_n} length-excluded > {args.max_seq_len} tokens)", file=sys.stderr)
+    if val_cap:
+        print(f"val cap:  {val_cap} tokens; {n_val_to_train} val record(s) over the cap "
+              f"routed to train", file=sys.stderr)
     if src_tok:
         print(f"src tokens (approx): min {min(src_tok)} / "
               f"median {sorted(src_tok)[len(src_tok)//2]} / max {max(src_tok)}", file=sys.stderr)
@@ -428,6 +532,23 @@ def main() -> int:
                   else "EXCLUDED (pass --include-untagged-as-document to keep)")
         print(f"untagged sessions (no aligned TOPs): {len(uniq)} {action}; "
               f"logged to {args.out_dir / 'untagged_sessions.json'}", file=sys.stderr)
+
+    # Per-TOP exclusion report: every dropped/rerouted item with its reason, so the
+    # excluded material can be reviewed before deciding what to recover into with-docs.
+    if exclusion_rows:
+        report_path = args.out_dir / "exclusions_report.tsv"
+        order = {"speaker-excluded": 0, "target-too-short": 1, "length-excluded": 2,
+                 "no-aligned-TOPs": 3, "val-overflow": 4}
+        rows = sorted(exclusion_rows, key=lambda r: (order.get(r[2], 9), r[0], r[1]))
+        lines = ["stem\ttop\treason\tseq_tokens\tdisposition"]
+        lines += ["\t".join(r) for r in rows]
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r[2]] = counts.get(r[2], 0) + 1
+        tally = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        print(f"exclusion report: {len(rows)} row(s) ({tally}) -> {report_path}",
+              file=sys.stderr)
 
     # Merge length exclusions into the exclusions file (union with speaker-based
     # exclusions). Records over the context window are excluded, not truncated.
