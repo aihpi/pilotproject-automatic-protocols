@@ -45,6 +45,8 @@ AGENDA_ANCHOR_RE = re.compile(r"(?im)Tagesordnung")
 AGENDA_BULLET_RE = re.compile(r"^-\s*(\d+(?:\.\d+)?)\s+(.+)$")          # "- 1 Title"
 AGENDA_TABLE_RE = re.compile(r"^\|\s*(\d+(?:\.\d+)?)\s*\|\s*([^|]+?)\s*\|")  # "| 1 | Title | …"
 AGENDA_ORDINAL_RE = re.compile(r"^(\d+)\.\s+(\S.*)$")                   # "1. Title"
+AGENDA_PLAIN_RE = re.compile(r"^(\d+)\s+(\S.*)$")                       # "1 Title" (no dot/bullet)
+AGENDA_NUM_ONLY_RE = re.compile(r"^(\d+)$")                            # bare "1"; title on next line(s)
 _NOT_AGENDA_TITLE_RE = re.compile(r"^(\(|\d|(?i:\(?(teilweise\s+)?(öffentlich|nicht)))")
 
 TURN_TEXT_CAP = 300   # chars of each turn shown to the LLM
@@ -64,21 +66,42 @@ def _is_agenda_title(title: str) -> bool:
 
 
 def parse_agenda(cover_text: str) -> dict[int, str]:
-    """Return ``{integer_top: title}`` from the cover agenda (heading or table)."""
+    """Return ``{integer_top: title}`` from the cover agenda (heading or table).
+
+    Handles the agenda-line shapes Docling emits: ``- 1 Title`` (bullet),
+    ``| 1 | Title |`` (table), ``1. Title`` (ordinal), ``1 Title`` (no dot), and a
+    bare ``1`` whose title is wrapped onto the following line(s) — the last two occur
+    on the single-TOP WP7 budget protocols where the others would parse to nothing.
+    """
     m = AGENDA_ANCHOR_RE.search(cover_text)
     if not m:
         return {}
     tops: dict[int, str] = {}
-    for line in cover_text[m.end():].splitlines():
-        s = line.strip()
+    lines = cover_text[m.end():].splitlines()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
         bm = (AGENDA_BULLET_RE.match(s) or AGENDA_TABLE_RE.match(s)
-              or AGENDA_ORDINAL_RE.match(s))
-        if not bm:
+              or AGENDA_ORDINAL_RE.match(s) or AGENDA_PLAIN_RE.match(s))
+        if bm:
+            title = bm.group(2).strip()
+            if _is_agenda_title(title):
+                tops.setdefault(int(bm.group(1).split(".")[0]), title)
+            i += 1
             continue
-        title = bm.group(2).strip()
-        if not _is_agenda_title(title):
+        nm = AGENDA_NUM_ONLY_RE.match(s)
+        if nm:
+            # Bare number: take the next non-empty line as the title (wrapped agenda item).
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                title = lines[j].strip()
+                if _is_agenda_title(title):
+                    tops.setdefault(int(nm.group(1)), title)
+            i = j + 1
             continue
-        tops.setdefault(int(bm.group(1).split(".")[0]), title)
+        i += 1
     return tops
 
 
@@ -279,7 +302,7 @@ def refine_boundaries(turns: list[dict], top_to_turn: dict[int, int], *,
         segs = _segment_lines(turn)
         if len(segs) < 2:
             continue
-        numbered = "\n".join(f"{i}. {_seg_text(l)}" for i, l in enumerate(segs, 1))
+        numbered = "\n".join(f"{i}. {_seg_text(sl)}" for i, sl in enumerate(segs, 1))
         try:
             res = llm_utils.chat_json(client, model,
                                       BOUNDARY_SPLIT_PROMPT + "\n\nABSCHNITT:\n" + numbered,
@@ -301,9 +324,9 @@ def refine_boundaries(turns: list[dict], top_to_turn: dict[int, int], *,
             spk = turn["lines"][0]
             segs = _segment_lines(turn)
             prev_half = {"label": turn["label"], "lines": [spk] + segs[:n],
-                         "text": " ".join(_seg_text(l) for l in segs[:n])}
+                         "text": " ".join(_seg_text(sl) for sl in segs[:n])}
             new_half = {"label": turn["label"], "lines": [spk] + segs[n:],
-                        "text": " ".join(_seg_text(l) for l in segs[n:])}
+                        "text": " ".join(_seg_text(sl) for sl in segs[n:])}
             new_turns.append(prev_half)                           # stays with the previous TOP
             if i in ti_to_top:
                 remap[ti_to_top[i]] = len(new_turns)              # tag moves before the new half

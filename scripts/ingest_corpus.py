@@ -26,14 +26,27 @@ its derived fields, source paths and any flags). Symlinking is idempotent
 After transcription, ``--merge-parts`` concatenates the per-part transcript
 markdown (``<stem>_Transkript.ptNN.md``) back into one ``<stem>_Transkript.md``
 so the dataset builder sees a single transcript per session.
+
+**Incremental tracking.** A persistent ledger (``data/ingest_ledger.json``) records
+each session by stem with a size+mtime signature of its source files, so repeated
+runs can tell apart what is **NEW**, **UNCHANGED**, **CHANGED** (source bytes differ)
+or **MISSING** (in the ledger but gone from disk). Alongside the full
+``manifest.txt`` the run writes a **delta manifest** (``manifest_new.txt``) listing
+only the NEW/CHANGED trainable sessions, so downstream transcription and the LLM
+prepare-stages can process just the new drop instead of the whole corpus. The first
+run (no ledger) classifies everything as NEW; ``--no-ledger`` restores the old
+behaviour.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 PDF_SUFFIXES = (".pdf",)
@@ -131,6 +144,60 @@ def relink(link: Path, target: Path, *, overwrite: bool, dry_run: bool) -> str:
     return "linked"
 
 
+LEDGER_VERSION = 1
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def file_signature(p: Path, *, use_hash: bool) -> dict:
+    """Cheap change-detection signature for one source file (follows symlinks)."""
+    st = p.stat()
+    if use_hash:
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return {"size": st.st_size, "sha256": h.hexdigest()}
+    return {"size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def session_signature(pdf_src: Path | None, audios: list[Path], *, use_hash: bool) -> dict:
+    return {
+        "pdf": file_signature(pdf_src, use_hash=use_hash) if pdf_src else None,
+        "audio": [file_signature(a, use_hash=use_hash) for a in audios],
+    }
+
+
+def load_ledger(path: Path) -> dict:
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.setdefault("version", LEDGER_VERSION)
+            data.setdefault("sessions", {})
+            return data
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"warning: could not read ledger {path} ({e}); starting fresh",
+                  file=sys.stderr)
+    return {"version": LEDGER_VERSION, "sessions": {}}
+
+
+def save_ledger(path: Path, ledger: dict) -> None:
+    """Write the ledger atomically (temp file in the same dir + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(ledger, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def classify(stem: str, sig: dict, ledger: dict) -> str:
+    rec = ledger["sessions"].get(stem)
+    if rec is None:
+        return "NEW"
+    return "UNCHANGED" if rec.get("signature") == sig else "CHANGED"
+
+
 def ingest(args: argparse.Namespace) -> int:
     raw_dir: Path = args.raw_dir
     if not raw_dir.is_dir():
@@ -140,7 +207,14 @@ def ingest(args: argparse.Namespace) -> int:
     pdf_dir = args.out_root / "protocols" / "pdf"
     audio_dir = args.out_root / "transcripts" / "audio"
     manifest_path = args.out_root / "transcripts" / "manifest.txt"
+    manifest_new_path = args.manifest_new
     report_path = args.out_root / "ingest_report.tsv"
+    ledger_path = args.ledger
+
+    use_ledger = not args.no_ledger
+    ledger = load_ledger(ledger_path) if use_ledger else {"version": LEDGER_VERSION, "sessions": {}}
+    new_sessions: dict[str, dict] = {}  # this run's ledger records, keyed by stem
+    now = _utcnow()
 
     sessions = find_sessions(raw_dir)
     print(f"found {len(sessions)} session folder(s) under {raw_dir}", file=sys.stderr)
@@ -148,6 +222,8 @@ def ingest(args: argparse.Namespace) -> int:
     rows: list[dict] = []
     seen: dict[str, Path] = {}
     manifest: list[str] = []
+    manifest_new: list[str] = []
+    state_counts: dict[str, int] = {"NEW": 0, "UNCHANGED": 0, "CHANGED": 0}
 
     for sess in sessions:
         rel_parts = sess.relative_to(raw_dir).parts
@@ -192,21 +268,48 @@ def ingest(args: argparse.Namespace) -> int:
                 staged_audio.append(link)
 
         # Manifest = trainable sessions only (both a protocol and audio present).
-        if pdf_src and staged_audio:
+        trainable = bool(pdf_src and staged_audio)
+        if trainable:
             manifest.extend(str(p) for p in staged_audio)
+
+        # Incremental state: classify against the ledger (skip collided duplicates).
+        is_collision = any(f.startswith("COLLISION_WITH") for f in flags)
+        if not use_ledger:
+            state = "-"
+        elif is_collision:
+            state = "DUPLICATE"
+        else:
+            sig = session_signature(pdf_src, audios, use_hash=args.hash)
+            state = classify(stem, sig, ledger)
+            state_counts[state] = state_counts.get(state, 0) + 1
+            prev = ledger["sessions"].get(stem, {})
+            new_sessions[stem] = {
+                "stem": stem, "committee": abbr, "wp": wp or None,
+                "sitting": sitting, "raw_dir": str(sess.relative_to(raw_dir)),
+                "pdf_src": str(pdf_src.relative_to(raw_dir)) if pdf_src else None,
+                "audio_src": [str(a.relative_to(raw_dir)) for a in audios],
+                "signature": sig,
+                "first_seen": prev.get("first_seen", now), "last_seen": now,
+            }
+            if trainable and state in ("NEW", "CHANGED"):
+                manifest_new.extend(str(p) for p in staged_audio)
 
         rows.append({
             "stem": stem, "committee": abbr, "wp": wp or "-",
             "sitting": sitting if sitting is not None else "-",
             "n_pdf": len(pdfs), "n_audio": len(audios),
             "flags": ";".join(flags) if flags else "OK",
+            "state": state,
             "pdf_src": str(pdf_src.relative_to(raw_dir)) if pdf_src else "-",
             "audio_src": (str(audios[0].relative_to(raw_dir)) if audios else "-")
             + (f" (+{len(audios)-1} more)" if len(audios) > 1 else ""),
         })
 
+    # Sessions in the ledger that were not seen this run = MISSING.
+    missing = sorted(s for s in ledger["sessions"] if s not in new_sessions) if use_ledger else []
+
     # Reports.
-    cols = ["stem", "committee", "wp", "sitting", "n_pdf", "n_audio", "flags",
+    cols = ["stem", "committee", "wp", "sitting", "n_pdf", "n_audio", "flags", "state",
             "pdf_src", "audio_src"]
     if not args.dry_run:
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,21 +320,40 @@ def ingest(args: argparse.Namespace) -> int:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text("\n".join(manifest) + ("\n" if manifest else ""),
                                  encoding="utf-8")
+        if use_ledger:
+            manifest_new_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_new_path.write_text(
+                "\n".join(manifest_new) + ("\n" if manifest_new else ""), encoding="utf-8")
+            final = dict(new_sessions)
+            if not args.prune_missing:
+                for stem in missing:
+                    final[stem] = ledger["sessions"][stem]
+            save_ledger(ledger_path, {"version": LEDGER_VERSION,
+                                      "sessions": {k: final[k] for k in sorted(final)}})
 
     n_ok = sum(1 for r in rows if r["flags"] == "OK")
     n_flag = len(rows) - n_ok
-    print(f"\n=== ingest summary ===", file=sys.stderr)
+    print("\n=== ingest summary ===", file=sys.stderr)
     print(f"sessions: {len(rows)} ({n_ok} clean, {n_flag} flagged)", file=sys.stderr)
     print(f"trainable (PDF + audio) sessions in manifest: "
           f"{len(set(Path(m).name.split('_Transkript')[0] for m in manifest))} "
           f"({len(manifest)} audio file(s))", file=sys.stderr)
+    if use_ledger:
+        print(f"state: {state_counts['NEW']} new, {state_counts['CHANGED']} changed, "
+              f"{state_counts['UNCHANGED']} unchanged, {len(missing)} missing", file=sys.stderr)
+        new_stems = sorted(set(Path(m).name.split('_Transkript')[0] for m in manifest_new))
+        print(f"delta manifest: {len(new_stems)} trainable new/changed session(s)", file=sys.stderr)
+        if missing:
+            print(f"  MISSING (in ledger, not on disk): {', '.join(missing)}"
+                  + ("  [pruned]" if args.prune_missing else ""), file=sys.stderr)
     for r in rows:
         if r["flags"] != "OK":
             print(f"  FLAG {r['stem']}: {r['flags']}", file=sys.stderr)
     if args.dry_run:
-        print("(dry-run: no symlinks, manifest or report written)", file=sys.stderr)
+        print("(dry-run: no symlinks, manifests, report or ledger written)", file=sys.stderr)
     else:
-        print(f"wrote {report_path} and {manifest_path}", file=sys.stderr)
+        print(f"wrote {report_path}, {manifest_path}"
+              + (f", {manifest_new_path}, {ledger_path}" if use_ledger else ""), file=sys.stderr)
     return 0
 
 
@@ -273,6 +395,18 @@ def main() -> int:
                    help="Replace existing symlinks / merged files")
     p.add_argument("--dry-run", action="store_true",
                    help="Print what would be staged without writing anything")
+    p.add_argument("--ledger", type=Path, default=Path("data/ingest_ledger.json"),
+                   help="Persistent ingest state file (default: data/ingest_ledger.json)")
+    p.add_argument("--manifest-new", type=Path,
+                   default=Path("data/transcripts/manifest_new.txt"),
+                   help="Delta manifest of NEW/CHANGED trainable sessions "
+                        "(default: data/transcripts/manifest_new.txt)")
+    p.add_argument("--hash", action="store_true",
+                   help="Use sha256 signatures instead of size+mtime (slower, robust)")
+    p.add_argument("--prune-missing", action="store_true",
+                   help="Drop ledger records whose sources are gone from disk this run")
+    p.add_argument("--no-ledger", action="store_true",
+                   help="Disable the ledger / delta manifest (legacy behaviour)")
     p.add_argument("--merge-parts", action="store_true",
                    help="Post-transcription: merge <stem>_Transkript.ptNN.md parts "
                         "into <stem>_Transkript.md (uses --transcript-dir)")

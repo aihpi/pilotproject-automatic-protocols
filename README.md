@@ -37,7 +37,7 @@ The screenshots below are placeholders from the sister project
 
 | stage | script | what it does |
 |---|---|---|
-| **A. Ingest** | `scripts/ingest_corpus.py`, `pdf_to_markdown.py`, `docx_to_markdown.py`, `transcribe.py` | stage the raw corpus; PDF/DOCX/audio → markdown |
+| **A. Ingest** | `scripts/import_dropzip.py`, `ingest_corpus.py`, `pdf_to_markdown.py`, `docx_to_markdown.py`, `transcribe.py` | reshape new flat data drops into the corpus, stage it (incrementally), PDF/DOCX/audio → markdown |
 | **B. Prepare** | `tag_transcript_tops.py`, `match_speakers.py` | tag agenda-item (TOP) boundaries and resolve speaker names → `data/transcripts/md_prepared/` |
 | **C. Dataset** | `scripts/build_dataset.py` | pair transcripts↔protocols per TOP, write chat-format `train/val.jsonl` |
 | **D. Train** | `scripts/train_lora_unsloth.py` (+ `train_lora_unsloth.sbatch`) | canonical Unsloth (Q)LoRA fine-tune on SLURM, single H100; alternative stacks (PEFT/FSDP/Keras/Axolotl) live in `alternative_frameworks/` |
@@ -114,8 +114,11 @@ sub-folder so you can inspect intermediates.
 data/raw/                                read-only symlink → shared corpus (nested Committee/[WP/]Session/)
 data/protocols/pdf/      <stem>_Protokoll.pdf   A0 → symlinks to raw protocol PDFs (input)
 data/transcripts/audio/  <stem>_Transkript.mp3  A0 → symlinks to raw session MP3s (input)
-data/transcripts/manifest.txt            A0 → staged audio paths of trainable sessions
-data/ingest_report.tsv                   A0 → per-session stem/flags audit
+data/transcripts/manifest.txt            A0 → staged audio paths of trainable sessions (full corpus)
+data/transcripts/manifest_new.txt        A0 → delta manifest: only NEW/CHANGED sessions (incremental runs)
+data/ingest_report.tsv                   A0 → per-session stem/flags/state audit
+data/ingest_ledger.json                  A0 → persistent record of what has been ingested (incremental tracking)
+data/import_report.tsv                   A0 → import_dropzip.py audit for a new flat drop
 data/protocols/md/                       A → markdown protocols  ← protocol source (cleaned internally at build)
 data/protocols/md_clean/   (+ cover/)    A → OPTIONAL inspection output of preprocess_protocol.py (not a build input)
 data/transcripts/md/                     A → diarised transcripts (<SD-SPK>SPEAKER_NN, timestamps)
@@ -156,6 +159,43 @@ after transcription, merge the parts back into one transcript:
 ```bash
 uv run python scripts/ingest_corpus.py --merge-parts --transcript-dir data/transcripts/md
 ```
+
+#### Adding a new data drop (`import_dropzip.py`)
+
+New deliveries often arrive as a **flat** folder (e.g. an unzipped `Daten/`) named
+`<sitting>. <ABBR> {vom|am} <DD.MM.YYYY>[ Teil N][ (2)].{mp3,pdf}`, not the nested
+`Committee/[WP/]Session/` layout. `scripts/import_dropzip.py` reshapes it into the corpus so
+`ingest_corpus.py` can stage it unchanged. Stems become `<ABBR>_<WP>_<NN>`.
+
+```bash
+# unzip the drop somewhere, then preview the planned placement (writes nothing):
+uv run python scripts/import_dropzip.py import --drop-dir /path/to/Daten --dry-run
+
+# committee folders may be root-owned (no sudo): adopt them once (moves the original to a
+# data2_archive/ sibling, copies it back user-owned), then import for real:
+uv run python scripts/import_dropzip.py adopt  --committees "A 11 (AHF)" "A 6 (AWFK)"
+uv run python scripts/import_dropzip.py import --drop-dir /path/to/Daten   # --wp N (default 7)
+```
+
+Multipart audio (`… Teil 1/2`, or a second `(2)` recording) is placed as ordered parts in one
+session folder; an identical duplicate PDF is deduped. Review `data/import_report.tsv`, then run
+`ingest_corpus.py`.
+
+#### Incremental ingest (ledger + delta manifest)
+
+`ingest_corpus.py` keeps a persistent **ledger** (`data/ingest_ledger.json`) keyed by stem with a
+size+mtime signature of each session's sources. Every run classifies sessions as
+**NEW / UNCHANGED / CHANGED / MISSING** (shown in the `state` column of `ingest_report.tsv`) and
+writes a **delta manifest** `data/transcripts/manifest_new.txt` listing only the NEW/CHANGED
+trainable sessions, so transcription and the LLM prepare-stages can process just the new drop
+instead of the whole corpus. The first run (no ledger) marks everything NEW; `--no-ledger`
+restores the old behaviour, `--hash` uses sha256 signatures, `--prune-missing` forgets vanished
+sessions.
+
+> When bootstrapping the ledger on a corpus whose transcripts already exist, transcribe the genuine
+> delta by listing the manifest entries whose `data/transcripts/md/<stem>_Transkript.md` is missing
+> (the ledger's first-run "all NEW" cannot tell apart pre-existing sessions). Subsequent drops get a
+> correct delta straight from `manifest_new.txt`.
 
 ### A. Data conversion & cleaning
 

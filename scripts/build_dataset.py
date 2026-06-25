@@ -21,8 +21,8 @@ the split. Runs on CPU; no GPU needed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import random
 import re
 import sys
 from pathlib import Path
@@ -104,6 +104,45 @@ def normalise_stem(stem: str) -> str:
         s = s.replace(word, "")
     s = re.sub(r"[^\w\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def is_val_session(key: str, val_frac: float, seed: int) -> bool:
+    """Deterministic, *pinned* train/val assignment for one session.
+
+    Hashes the (seed, normalised key) so a session always lands on the same side
+    regardless of how many other sessions exist — unlike a shuffle of the session
+    list, where adding a new drop reshuffles the whole split. This keeps the val
+    set stable across rebuilds (a fixed --seed alone does not, once the corpus
+    changes)."""
+    h = hashlib.md5(f"{seed}:{key}".encode("utf-8")).digest()
+    return (int.from_bytes(h[:8], "big") % 10_000) < round(val_frac * 10_000)
+
+
+def canon_key(stem: str) -> str:
+    """Loose canonical form for holdout matching: normalise, then underscores -> spaces.
+
+    Session keys keep a trailing ``_`` from the stripped role word (``ARD_1_Transkript``
+    -> ``ard_1_``), while a bare manifest stem normalises to ``ard_1``; collapsing
+    underscores to spaces makes both ``ard 1`` so they compare equal."""
+    return re.sub(r"\s+", " ", normalise_stem(stem).replace("_", " ")).strip()
+
+
+def read_holdout(manifest: Path | None, extra: list[str]) -> set[str]:
+    """Canonical session keys to exclude from train+val (e.g. the eval test set).
+
+    Reads the ``stem`` column of a TSV manifest (header required) plus any
+    ``--holdout-stems``; both pass through ``canon_key`` to match internal keys."""
+    stems: list[str] = list(extra)
+    if manifest and manifest.exists():
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        if lines:
+            header = lines[0].split("\t")
+            idx = header.index("stem") if "stem" in header else 1
+            for line in lines[1:]:
+                cols = line.split("\t")
+                if len(cols) > idx and cols[idx].strip():
+                    stems.append(cols[idx].strip())
+    return {canon_key(s) for s in stems}
 
 
 def read_transcript(path: Path, *, converter=None) -> str:
@@ -330,7 +369,12 @@ def main() -> int:
     p.add_argument("--system-prompt-file", type=Path, default=None,
                    help="File with a custom system prompt (default: built-in German prompt)")
     p.add_argument("--seed", type=int, default=42,
-                   help="Seed for the session-level train/val shuffle (default: 42)")
+                   help="Seed for the pinned per-session train/val hash (default: 42)")
+    p.add_argument("--holdout-manifest", type=Path, default=None,
+                   help="TSV with a 'stem' column whose sessions are EXCLUDED from train+val "
+                        "(e.g. test/manifest.tsv, the held-out eval set)")
+    p.add_argument("--holdout-stems", nargs="*", default=[],
+                   help="Extra session stems to exclude from train+val (normalised internally)")
     p.add_argument("--exclusions", type=Path, default=None,
                    help="JSON {stem: [tops]} of per-TOP records to skip "
                         "(e.g. match_speakers.py exclusions.json)")
@@ -342,6 +386,11 @@ def main() -> int:
     if args.exclusions and args.exclusions.exists():
         raw = json.loads(args.exclusions.read_text(encoding="utf-8"))
         excluded = {k: set(v) for k, v in raw.items()}
+
+    holdout = read_holdout(args.holdout_manifest, args.holdout_stems)
+    if holdout:
+        print(f"holdout (excluded from train+val): {len(holdout)} session(s): "
+              f"{', '.join(sorted(holdout))}", file=sys.stderr)
 
     if not args.max_seq_len:  # None or 0 -> fall back to the model's full context window
         args.max_seq_len = context_window(args.base_model)
@@ -387,6 +436,9 @@ def main() -> int:
     exclusion_rows: list[tuple[str, str, str, str, str]] = []
     for tx_path, pr_path in tqdm(pairs, desc="build", unit="pair"):
         key = normalise_stem(tx_path.stem)
+        if canon_key(tx_path.stem) in holdout:  # held-out eval session: never in train/val
+            print(f"  holdout: skipping {tx_path.name}", file=sys.stderr)
+            continue
         try:
             transcript = read_transcript(tx_path, converter=converter)
             protocol = read_protocol(pr_path, marker=args.marker, converter=converter)
@@ -463,10 +515,11 @@ def main() -> int:
         print("no records produced", file=sys.stderr)
         return 2
 
+    # Pinned per-session train/val split: each session is assigned by hashing its
+    # own key, so the val set is stable across rebuilds and new drops never reshuffle
+    # existing sessions across the split.
     keys = sorted(sessions)
-    random.Random(args.seed).shuffle(keys)
-    n_val = max(1, round(len(keys) * args.val_frac)) if len(keys) > 1 else 0
-    val_keys = set(keys[:n_val])
+    val_keys = {k for k in keys if is_val_session(k, args.val_frac, args.seed)}
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     train_path = args.out_dir / "train.jsonl"
