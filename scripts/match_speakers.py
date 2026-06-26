@@ -279,6 +279,96 @@ def _match_candidate(name: str, key_to_person: dict[str, dict], assigned: set) -
     return best_key if best >= 85 else None
 
 
+# --------------------------------------------------------------- transcript-LLM tier
+
+def llm_resolve_from_transcript(client, model: str, turns: list[dict],
+                                resolved: dict[str, dict], key_to_person: dict[str, dict],
+                                max_tokens: int) -> int:
+    """Identify still-unresolved speakers from the TRANSCRIPT itself (not the protocol
+    directory).
+
+    The directory tiers can only assign names that appear in the protocol; guests/experts
+    who speak but are absent from the protocol stay ``SPEAKER_NN``. Here the model reads the
+    transcript context — the chair's give-the-floor announcement (usually at the END of the
+    previous turn, e.g. "Herr Klemm, bitte"), self-introductions, or direct address — and
+    names the speaker verbatim from the transcript. Synthesises a person entry (so it flows
+    through the normal rewrite/report) and accepts only ``confidence == "certain"``. Returns
+    the number of newly resolved labels."""
+    unresolved = sorted({t["label"] for t in turns if t["label"] not in resolved and t["text"]})
+    if not unresolved:
+        return 0
+    utt: dict[str, list[str]] = {}
+    handoff: dict[str, list[str]] = {}
+    for i, t in enumerate(turns):
+        if t["label"] not in unresolved or not t["text"]:
+            continue
+        if len(" ".join(utt.get(t["label"], []))) < 1500:
+            utt.setdefault(t["label"], []).append(t["text"])
+        if i > 0 and turns[i - 1]["label"] != t["label"]:
+            tail = turns[i - 1]["text"][-300:].strip()
+            if tail and tail not in handoff.get(t["label"], []):
+                handoff.setdefault(t["label"], []).append(tail)
+    try:
+        mapping = llm_utils.chat_json(client, model, _build_transcript_llm_prompt(utt, handoff),
+                                      max_tokens=max_tokens)
+    except Exception:
+        return 0
+    assigned = {info["key"] for info in resolved.values()}
+    n_new = 0
+    for label, info in mapping.items():
+        if label in resolved or not isinstance(info, dict):
+            continue
+        if str(info.get("confidence", "")).lower() != "certain":
+            continue
+        name = (info.get("name") or "").strip()
+        if not name or name.lower() in ("null", "none", "unbekannt"):
+            continue
+        role = (info.get("role") or "").strip()
+        if role.lower() in ("null", "none"):
+            role = ""
+        # If the transcript name matches a directory person earlier tiers missed (e.g. an
+        # ASR spelling variant of a cover member), snap to that canonical entry; otherwise
+        # synthesise a new person (a genuine guest absent from the protocol).
+        dkey = _match_candidate(name, key_to_person, assigned)
+        if dkey:
+            key = dkey
+        else:
+            key, surname = canonical_name(name)
+            if not key or key in assigned:       # skip empties + names already taken
+                continue
+            key_to_person.setdefault(key, {"full": name, "role": role,
+                                           "key": key, "surname": surname})
+        resolved[label] = {"key": key, "method": "transcript-llm", "score": 1.0}
+        assigned.add(key)
+        n_new += 1
+    return n_new
+
+
+def _build_transcript_llm_prompt(utt: dict[str, list[str]],
+                                 handoff: dict[str, list[str]]) -> str:
+    lines = [
+        "Du identifizierst Sprecher in einem Ausschuss-Transkript ANHAND DES TRANSKRIPTS.",
+        "Diese Sprecher stehen NICHT in einer Namensliste; ermittle den Namen aus dem Kontext:",
+        "- Die/der Vorsitzende kündigt die nächste Person oft am ENDE des vorherigen Beitrags "
+        "an („Herr Klemm, bitte.“, „jetzt hat Frau Sademach das Wort“).",
+        "- Selbstvorstellung („mein Name ist …“) oder direkte Anrede durch andere.",
+        "Gib den Namen WÖRTLICH wie im Transkript an (inkl. Anrede/Titel, falls genannt) und die "
+        "Rolle/Funktion, falls genannt.",
+        "",
+    ]
+    for label in utt:
+        lines.append(f"[{label}]")
+        if handoff.get(label):
+            lines.append("  ANKÜNDIGUNG (Ende des vorherigen Beitrags): "
+                         + (" | ".join(handoff[label]))[:600])
+        lines.append("  REDEBEITRAG: " + (" ".join(utt[label]))[:1500])
+    lines += ["",
+              'Gib NUR JSON zurück: {"SPEAKER_NN": {"name": "<Name aus dem Transkript oder null>", '
+              '"role": "<Rolle/Funktion oder null>", "confidence": "certain|unsure"}}. '
+              'Verwende "certain" nur, wenn der Name eindeutig aus dem Kontext hervorgeht. Rate nicht.']
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------- emit / exclude
 
 def rewrite_transcript(text: str, label_to_name: dict[str, str]) -> str:
@@ -338,7 +428,8 @@ def pair_files(transcript_dir: Path, protocol_dir: Path) -> list[tuple[Path, Pat
 
 
 def process_pair(tpath: Path, ppath: Path, *, client, model: str,
-                 content_threshold: float, max_sentences: int, max_tokens: int) -> dict:
+                 content_threshold: float, max_sentences: int, max_tokens: int,
+                 transcript_llm: bool = False) -> dict:
     ttext = tpath.read_text(encoding="utf-8")
     cover, body, _ = clean_protocol(ppath.read_text(encoding="utf-8"))
     directory = extract_speaker_directory(cover, body)
@@ -356,6 +447,8 @@ def process_pair(tpath: Path, ppath: Path, *, client, model: str,
     if client is not None:
         llm_resolve(client, model, turns, split_protocol_by_top(body), directory, resolved,
                     max_tokens)
+        if transcript_llm:  # recover guests absent from the protocol, named only in the transcript
+            llm_resolve_from_transcript(client, model, turns, resolved, key_to_person, max_tokens)
 
     label_to_name = {lab: format_speaker(key_to_person[info["key"]])
                      for lab, info in resolved.items() if info["key"] in key_to_person}
@@ -393,6 +486,10 @@ def main() -> int:
     p.add_argument("--max-tokens", type=int, default=llm_utils.DEFAULT_MAX_TOKENS,
                    help=f"Completion budget incl. reasoning (default: {llm_utils.DEFAULT_MAX_TOKENS})")
     p.add_argument("--concurrency", type=int, default=4, help="Parallel sessions (default: 4)")
+    p.add_argument("--transcript-llm", action="store_true",
+                   help="After the protocol-directory tiers, ask the LLM to name still-"
+                        "unresolved speakers from the TRANSCRIPT itself (chair hand-offs, self-"
+                        "introductions, direct address) — recovers guests absent from the protocol")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -416,7 +513,8 @@ def main() -> int:
         lambda pr: process_pair(pr[0], pr[1], client=client, model=args.llm_model,
                                 content_threshold=args.content_threshold,
                                 max_sentences=args.max_unresolved_sentences,
-                                max_tokens=args.max_tokens),
+                                max_tokens=args.max_tokens,
+                                transcript_llm=args.transcript_llm),
         args.concurrency)
 
     exclusions: dict[str, list[int]] = {}

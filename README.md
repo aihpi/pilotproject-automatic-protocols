@@ -46,6 +46,14 @@ The screenshots below are placeholders from the sister project
 Shared helper modules used across the stages live in `scripts/utils/` (`prompt_io`,
 `model_utils`, `llm_utils`, `speaker_utils`, `eval_io`, `alt_utils`).
 
+> **Dataset-creation vs. dataset-use.** Stages **A–C** (`import_dropzip.py`, `ingest_corpus.py`,
+> `pdf_to_markdown.py`, `docx_to_markdown.py`, `transcribe.py`, `tag_transcript_tops.py`,
+> `match_speakers.py`, `build_dataset.py`) exist **only to (re)build the training dataset from the raw
+> audio/PDF corpus**. If you already have the prepared dataset (`data/train_cap65k/`, the committed
+> deliverable), you do **not** run any of them — you only need stage **D** (`train_lora_unsloth.py`)
+> and stage **E** (`infer_summary.py` / `eval_lora.py`). Re-run A–C only to ingest a new data drop or
+> change the dataset.
+
 ## Repository structure
 
 ```
@@ -69,7 +77,7 @@ uv sync                                            # install the base environmen
 
 # Train (SLURM) — canonical Unsloth (Q)LoRA on the 31B, single H100
 BASE_MODEL=google/gemma-4-31B-it MAX_SEQ_LEN=65536 \
-  TRAIN_JSONL=data/train/train.jsonl VAL_JSONL=data/train/val.jsonl \
+  TRAIN_JSONL=data/train_cap65k/train.jsonl VAL_JSONL=data/train_cap65k/val.jsonl \
   sbatch scripts/train_lora_unsloth.sbatch
 
 # Infer with a trained adapter
@@ -126,7 +134,7 @@ data/transcripts/md_top/   (+ top_reports/)   B → transcripts with <SD-TOP> ag
 data/transcripts/md_prepared/            B → speaker labels replaced with real names  ← dataset source
 data/speaker_maps/                       B → per-session resolution reports
 data/exclusions.json                     B → TOPs to drop (unresolved speakers)
-data/train/{train,val}.jsonl             C → the LoRA dataset
+data/train_cap65k/{train,val}.jsonl      C → the LoRA dataset (the committed deliverable; other data/train_* are archived under data/archive/)
 results/lora_adapter/                    D → trained adapter
 results/summaries/                       E → generated protocols
 ```
@@ -285,10 +293,12 @@ protocol internally, so point `--protocol-dir` at raw `data/protocols/md` (or `m
 ```bash
 uv run python scripts/build_dataset.py \
     --transcript-dir data/transcripts/md_prepared --protocol-dir data/protocols/md \
-    --exclusions data/exclusions.json --granularity per-top --out-dir data/train
+    --exclusions data/exclusions.json --granularity per-top --include-untagged-as-document \
+    --holdout-manifest test/manifest.tsv --out-dir data/train_cap65k
 ```
 
-Output `data/train/{train,val}.jsonl`, one record per line:
+Output `data/train_cap65k/{train,val}.jsonl`, one record per line (the committed dataset; the exact
+recipe + provenance is in [`data/DATASETS.md`](data/DATASETS.md)):
 
 ```json
 {"messages": [{"role": "system",    "content": "Du bist Protokollführer/in eines Ausschusses. Wandle das wörtliche Transkript …"},
@@ -311,13 +321,13 @@ if you need TRL's prompt/completion or plain-text formats instead of `messages`.
 ### D. Train the adapter (GPU / SLURM)
 
 ```bash
-TRAIN_JSONL=data/train/train.jsonl sbatch scripts/train_lora_unsloth.sbatch
+TRAIN_JSONL=data/train_cap65k/train.jsonl sbatch scripts/train_lora_unsloth.sbatch
 ```
 
 | Variable      | Default                              |
 |---------------|--------------------------------------|
 | `TRAIN_JSONL` | (required)                           |
-| `VAL_JSONL`   | `data/train/val.jsonl` (if present)  |
+| `VAL_JSONL`   | `data/train_cap65k/val.jsonl` (if present)  |
 | `OUT_DIR`     | auto `results/YYYYMMDD-HHMMSS` (4-bit smoke → `results/smoke_lora`) |
 | `BASE_MODEL`  | `google/gemma-4-E2B-it`              |
 | `MAX_SEQ_LEN` | auto = model context window (empty)  |
