@@ -471,7 +471,9 @@ def main() -> int:
     p.add_argument("--out-transcript-dir", type=Path,
                    default=Path("data_example02/transcripts/md_prepared"))
     p.add_argument("--report-dir", type=Path, default=Path("data_example02/speaker_maps"))
-    p.add_argument("--exclusions-out", type=Path, default=Path("data_example02/exclusions.json"))
+    p.add_argument("--exclusions-out", type=Path, default=Path("data/exclusions/exclusions.json"),
+                   help="Where to write the {stem: [tops]} exclusions manifest. All exclusions "
+                        "files live under data/exclusions/ (default: data/exclusions/exclusions.json)")
     p.add_argument("--content-threshold", type=float, default=75.0,
                    help="Min rapidfuzz score for a (secondary) content match (default: 75)")
     p.add_argument("--max-unresolved-sentences", type=int, default=MAX_UNRESOLVED_SENTENCES,

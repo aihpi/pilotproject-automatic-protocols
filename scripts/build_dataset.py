@@ -337,8 +337,10 @@ def main() -> int:
     p.add_argument("--protocol-dir", type=Path, default=Path("data/protocols/md"),
                    help="Directory of protocol files, .md/.pdf (default: data/protocols/md; "
                         "protocols are cleaned internally, so the raw md/ dir is fine)")
-    p.add_argument("--out-dir", type=Path, default=Path("data/train"),
-                   help="Output directory for train.jsonl / val.jsonl (default: data/train)")
+    p.add_argument("--out-dir", type=Path, default=Path("data/train/dataset"),
+                   help="Output directory for train.jsonl / val.jsonl. Each generated dataset "
+                        "gets its own subfolder under data/train/, e.g. data/train/cap65k "
+                        "(default: data/train/dataset)")
     p.add_argument("--granularity", choices=("document", "per-top"), default="per-top",
                    help="Segmentation strategy (default: per-top)")
     p.add_argument("--include-untagged-as-document", action="store_true",
@@ -376,8 +378,10 @@ def main() -> int:
     p.add_argument("--holdout-stems", nargs="*", default=[],
                    help="Extra session stems to exclude from train+val (normalised internally)")
     p.add_argument("--exclusions", type=Path, default=None,
-                   help="JSON {stem: [tops]} of per-TOP records to skip "
-                        "(e.g. match_speakers.py exclusions.json)")
+                   help="JSON {stem: [tops]} of per-TOP records to skip. Exclusions files "
+                        "live under data/exclusions/ (e.g. data/exclusions/exclusions_tllm.json, "
+                        "written by match_speakers.py). Length exclusions found here are merged "
+                        "back into this file.")
     p.add_argument("--overwrite", action="store_true",
                    help="Overwrite existing train.jsonl / val.jsonl")
     args = p.parse_args()

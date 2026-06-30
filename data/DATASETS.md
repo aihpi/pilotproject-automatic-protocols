@@ -19,14 +19,14 @@ diarised, TOP-tagged (B1, with the bare-number/wrapped-agenda parser fix) and sp
 606 via transcript-llm), recovering guests/experts absent from the protocol. Pinned per-session
 split (`build_dataset.py` hash split) and the `test/` eval sessions held out.
 
-**`data/train_cap65k/` is THE dataset** (the per-top, with-document-fallback, transcript-llm
+**`data/train/cap65k/` is THE dataset** (the per-top, with-document-fallback, transcript-llm
 build). Every other `data/train_*` folder was experimental and has been moved to
 `data/archive/` (16 dirs: caps 4k/16k/32k/uncapped, no-docs variants, footer-clean, wp7
 pre-transcript-llm, etc.).
 
 | dataset | path | cap | train | val | notes |
 |---|---|---|---|---|---|
-| **train_cap65k** | `data/train_cap65k/` | 65536 | 583 | 74 | per-top + 15 untagged-as-whole-document; transcript-llm speaker recovery |
+| **train_cap65k** | `data/train/cap65k/` | 65536 | 583 | 74 | per-top + 15 untagged-as-whole-document; transcript-llm speaker recovery |
 
 Build commands (the `with_docs` recipe; the folder was renamed `…_with_docs_cap65k_tllm` → `train_cap65k`):
 

@@ -25,8 +25,8 @@ set +a
 
 # Default dataset = 65k cap. Smoke: BASE_MODEL=google/gemma-4-E2B-it
 # MAX_SEQ_LEN=4096 MAX_STEPS=20
-TRAIN_JSONL="${TRAIN_JSONL:-data/train_no_docs_cap65k/train.jsonl}"
-VAL_JSONL="${VAL_JSONL:-data/train_no_docs_cap65k/val.jsonl}"
+TRAIN_JSONL="${TRAIN_JSONL:-data/train/cap65k/train.jsonl}"
+VAL_JSONL="${VAL_JSONL:-data/train/cap65k/val.jsonl}"
 OUT_DIR="${OUT_DIR:-}"             # empty = script auto-names results/YYYYMMDD-HHMMSS
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-31B-it}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-65536}"   # 65k cap (was 32768)
