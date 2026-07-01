@@ -204,6 +204,8 @@ cython_debug/
 logs/
 # Training outputs (adapters) and generated summaries
 results/
+# HuggingFace model/dataset cache (HF_HOME); multi-GB, may hold auth tokens — never commit
+hf-cache/
 
 # Local temporary files
 tmp/
