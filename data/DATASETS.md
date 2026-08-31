@@ -9,41 +9,46 @@ md_prepared (B2: match_speakers) → train_* (C: build_dataset)`. Only **stage C
 re-run for a prompt change; B1/B2 (LLM-driven TOP tagging + speaker resolution) already
 incorporate the joint-TOP fix in the current `data/transcripts/md_prepared`.
 
-## Superset + transcript-LLM build (2026-06-26) — CURRENT
+## Full-corpus enlarged build (2026-07-01) — CURRENT
 
-Full WP7 superset ingested (`Daten_full.zip`: 144 sessions across 6 committees AHF/HA/AWFK/AEE/
-SLausitz/AHK; the earlier 32-session `Daten.zip` is a subset). New WP7 sessions transcribed +
-diarised, TOP-tagged (B1, with the bare-number/wrapped-agenda parser fix) and speaker-resolved
-(B2). B2 was then re-run corpus-wide with the new transcript-driven tier
-(`match_speakers.py --transcript-llm`): corpus speaker resolution rose **51% → 74%** (+633 labels,
-606 via transcript-llm), recovering guests/experts absent from the protocol. Pinned per-session
-split (`build_dataset.py` hash split) and the `test/` eval sessions held out.
+All committees ingested for WP7 (alongside existing WP8): the WP7 superset plus the later
+Nextcloud drops — AIK, ARD (RA), ABJS, then AIL, ALEUV, ASGIV — for **325 paired sessions**.
+The ~207 new sessions were transcribed + diarised (Whisper large-v3 + pyannote), their protocol
+PDFs converted (`pdf_to_markdown`), TOP-tagged (B1) and speaker-resolved corpus-wide
+(B2, `--transcript-llm`). Run through the dependency-chained sbatch scripts
+(`tag_transcript_tops.sbatch` → `match_speakers.sbatch` → `build_dataset.sbatch`). Pinned
+per-session hash split; `test/` eval sessions held out (verified 0 leakage in train/val).
 
-**`data/train/cap65k/` is THE dataset** (the per-top, with-document-fallback, transcript-llm
-build). Every other `data/train_*` folder was experimental and has been moved to
-`data/archive/` (16 dirs: caps 4k/16k/32k/uncapped, no-docs variants, footer-clean, wp7
-pre-transcript-llm, etc.).
+**`data/train/cap65k/` is THE dataset** (per-top, with-document-fallback, transcript-llm).
 
-| dataset | path | cap | train | val | notes |
-|---|---|---|---|---|---|
-| **train_cap65k** | `data/train/cap65k/` | 65536 | 583 | 74 | per-top + 15 untagged-as-whole-document; transcript-llm speaker recovery |
+| dataset | path | cap | train | val | sessions | notes |
+|---|---|---|---|---|---|---|
+| **cap65k** | `data/train/cap65k/` | 65536 | 1122 | 106 | 325 (31 val) | per-top + 74 untagged→whole-doc; transcript-llm speaker recovery |
 
-Build commands (the `with_docs` recipe; the folder was renamed `…_with_docs_cap65k_tllm` → `train_cap65k`):
+Build (env-parameterised sbatch; secrets sourced from the home `.env` at submit — see script headers):
 
 ```
-uv run python scripts/match_speakers.py --transcript-dir data/transcripts/md_top \
-  --protocol-dir data/protocols/md --out-transcript-dir data/transcripts/md_prepared_tllm \
-  --report-dir data/speaker_maps_tllm --exclusions-out data/exclusions_tllm.json \
-  --transcript-llm --overwrite --concurrency 2     # low concurrency: gpt-oss throttles parallel calls
-cp data/exclusions_tllm.json data/exclusions_tllm_build.json
-uv run python scripts/build_dataset.py --transcript-dir data/transcripts/md_prepared_tllm \
-  --protocol-dir data/protocols/md --exclusions data/exclusions_tllm_build.json \
-  --granularity per-top --max-seq-len 65536 --include-untagged-as-document \
-  --holdout-manifest test/manifest.tsv --out-dir data/train_cap65k --overwrite
+sbatch scripts/tag_transcript_tops.sbatch                                     # B1 (incremental; skips already-tagged)
+OVERWRITE=1 TRANSCRIPT_LLM=1 sbatch scripts/match_speakers.sbatch             # B2 corpus-wide -> md_prepared_tllm + data/exclusions/exclusions_tllm.json
+OVERWRITE=1 EXCLUSIONS=data/exclusions/exclusions_tllm.json \
+  sbatch scripts/build_dataset.sbatch                                          # C -> data/train/cap65k
 ```
 
-Adapters: `results/YYYYMMDD-HHMMSS/`, mapping in `results/OVERVIEW_tllm.tsv`
-(gemma-4-31B-it + gemma-4-12B-it, both on `train_cap65k`).
+Build drops: 487 speaker-excluded TOPs, 10 target-too-short, 7 length-excluded (>65536 tok);
+29 val records over the 8192-token val cap routed to train. Exclusions now live in `data/exclusions/`.
+
+**Known speaker-ID imperfections (inspected + accepted 2026-07-01, recall over precision):** B2
+leaves ~894 partial/non-schema names — all from the transcript-llm tier, guest surnames such as
+"Herr Westphal" / "Frau Buttke" — and ~228 labels sit on cue-conflicted (under-segmented pyannote)
+clusters, so a minority of turns carry a wrong or partial speaker. Kept as-is. Gold protocol targets
+retain the real "Abgeordnete(r) Lastname (Fraktion)" wording; ASR-misheard surnames in the transcript
+prose are left uncorrected.
+
+Adapters: `results/YYYYMMDD-HHMMSS/`, mapping in `results/OVERVIEW_tllm.tsv`. The prior 2026-06-26
+build (583/74, WP7 superset only) is **superseded** by this enlarged build — but note the 31B adapter
+`results/20260626-115353` (job 2293906) was trained on that earlier 583/74 set, and the 12B run
+(job 2293907) failed on the transformers / `gemma4_unified` issue (GitHub issue #10). Retraining on
+this 1122/106 set is the next step once approved.
 
 ## Footer-cleaned 65k variants (built 2026-06-22) — superseded
 
