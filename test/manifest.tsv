@@ -1,0 +1,7 @@
+example	stem	source	tops	speakers	invented_speakers	transcript_words	gold_words	split_note
+short_ARD_1	ARD_1	archive/data_example02	6	5	0	4078	2330	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match
+mid_HA_1	HA_1	archive/data_example02	11	11	2	11076	5144	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match
+mid_HA_3	HA_3	archive/data_example02	1	7	5	8665	2142	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match
+mid_ABJS_5	ABJS_5	archive/data_example02	1	11	5	17401	5036	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match
+long_SBue_2	SBue_2	archive/data_example02	3	18	9	36840	18013	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match
+long_SBue_3	SBue_3	archive/data_example02	2	21	17	32846	14948	held out of every training split via --holdout-manifest; gold cleaned like the training targets; invented-speaker turns have no gold name match

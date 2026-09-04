@@ -1,0 +1,59 @@
+[project]
+name = "pilotproject-automatic-protocols"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.4",
+    "openai-whisper>=20250625",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0", # pulled by docling/transformers; must match cu128 torch
+    "torchaudio>=2.11.0", # pyannote runtime dep; must match cu128 torch
+    "tqdm>=4.67.3",
+    # Speaker diarisation (transcribe.py --diarize); gated model needs HF_TOKEN.
+    # 4.x is required: 3.x calls torchaudio.AudioMetaData, removed in the
+    # torchaudio 2.11 that matches torch 2.11. 4.x's pipelines load PLDA from the
+    # gated pyannote/speaker-diarization-community-1 repo, so request access to it
+    # (and accept segmentation-3.0) on HuggingFace before using --diarize.
+    "pyannote.audio>=4.0",
+    # Document conversion (transcript .docx / protocol .pdf -> markdown)
+    "docling>=2.0.0",
+    # Headless OpenCV: the cluster has no libGL, so the default opencv-python
+    # (pulled by docling's OCR deps) fails to import cv2. See [tool.uv] override.
+    "opencv-python-headless>=4.10.0.84",
+    "python-docx>=1.1.2", # raw-whitespace parsing for the one-off transcript repair
+    "rapidfuzz>=3.10.1",
+    # Speaker resolution LLM fallback (match_speakers.py --use-llm) + .env loading
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    # LoRA fine-tuning + inference stack
+    "transformers>=4.46.0",
+    "peft>=0.13.0",
+    "trl>=0.12.0",
+    "datasets>=3.0.0",
+    "accelerate>=1.0.0",
+    "bitsandbytes>=0.44.0",
+    "sentencepiece>=0.2.0",
+    "tensorboard>=2.20.0",
+]
+
+# Training stack: Unsloth is deliberately NOT a dependency or extra here. Resolving
+# it together with the base pins forces transformers and trl down several versions
+# for the whole environment, so the trainer and the Unsloth evaluation backend run
+# from a standalone venv built outside the resolver (recipe in
+# scripts/train_lora_unsloth.sbatch and README.md). The base venv covers ingest,
+# preparation, dataset build and the PEFT evaluation backend.
+
+[tool.uv]
+# Drop the non-headless opencv-python on Linux (no libGL on the cluster); cv2 is
+# then provided by opencv-python-headless above. Keep it available on macOS.
+override-dependencies = ["opencv-python ; platform_system == 'Darwin'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
