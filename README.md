@@ -7,7 +7,7 @@ This repository trains and evaluates a LoRA adapter for `google/gemma-4-31B-it` 
 
 ## What this repository contains, and what it does not
 
-The repository ships code and documentation only. The training corpus (audio recordings and protocol PDFs of the Landtag Brandenburg committees), every derived dataset, the held-out evaluation transcripts and the trained adapter weights are not part of it: the corpus is not redistributable, and the derived files contain it verbatim. `data/`, `results/` and `test/*/` are gitignored; only their ledgers (`data/DATASETS.md`, `results/README.md`, `test/manifest.tsv`) are tracked. To reproduce the work you need access to the corpus and an HPI cluster account, or your own SLURM cluster and the adjustments described below.
+The repository ships code and documentation only. The training corpus (audio recordings and protocol PDFs of the Landtag Brandenburg committees), every derived dataset and the held-out evaluation transcripts are not part of it, because they are far too large for a git repository. The trained adapter weights are published separately on the Hugging Face hub, see *The model* below. `data/`, `results/` and `test/*/` are gitignored; only their ledgers (`data/DATASETS.md`, `results/README.md`, `test/manifest.tsv`) are tracked. To reproduce the work you need access to the corpus and an HPI cluster account, or your own SLURM cluster and the adjustments described below.
 
 ## The model
 
@@ -20,6 +20,7 @@ The repository ships code and documentation only. The training corpus (audio rec
 | Data | `data/train/cap48k`: 1,115 training and 106 validation records from 320 sittings |
 | Training | 3 epochs, lr 2e-4, batch 1 x 4 accumulation, early stopping on validation loss, one H100 80 GB, about 19.5 h |
 | Result | validation loss 0.6927 (best checkpoint) |
+| Weights | [`aihpi/gemma-4-31b-protokoll`](https://huggingface.co/aihpi/gemma-4-31b-protokoll) on the Hugging Face hub |
 
 The cap was chosen by a sweep over otherwise identical runs:
 
@@ -31,6 +32,8 @@ The cap was chosen by a sweep over otherwise identical runs:
 | cap64k | 65,536 | 1,122 / 106 | CUDA out of memory at step 96 |
 
 The 65k run fails because the loss materialises a `sequence x 262,144` vocabulary logits tensor; on one 80 GB H100 the fused Unsloth cross-entropy carries records up to about 50k tokens. Details of the runs are in `results/README.md`, of the datasets in `data/DATASETS.md`. A report written for readers outside the project, covering the corpus, the preparation pipeline, the quality filters and the training configuration, is in [`docs/training-report.md`](docs/training-report.md).
+
+The adapter itself is published as [`aihpi/gemma-4-31b-protokoll`](https://huggingface.co/aihpi/gemma-4-31b-protokoll), tagged `v1.0`. Its model card carries the prompt contract the adapter was trained on, which anything calling it has to reproduce. Access to the weights is granted on request while the terms of publication are settled; the card is readable without one.
 
 ## Setup
 
